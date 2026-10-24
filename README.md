@@ -1,5 +1,7 @@
 # ListenFlow
 
+[![Desktop checks](https://github.com/Xin-Chen-Max/ListenFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/Xin-Chen-Max/ListenFlow/actions/workflows/ci.yml)
+
 A local English listening workspace. Transcribe a recording on your computer, follow the words during playback, and replay the parts you missed.
 
 ![ListenFlow transcript playback and saved practice clips](assets/listenflow-desktop.png)
@@ -51,7 +53,7 @@ This version is a personal desktop application. Android delivery and private pho
 
 Connected-speech suggestions are labelled **Possible pattern**. They are inferred from text and have not been confirmed in the audio. Editing a segment clears its old word alignment; playback then uses segment timing.
 
-The patched desktop environment passed its current known-vulnerability audit. Keep the application bound to loopback; [security notes](SECURITY.md) describe the audit scope and deployment boundary. Clean Windows runner installation is being verified separately.
+The patched desktop environment passed its current known-vulnerability audit. Keep the application bound to loopback; [security notes](SECURITY.md) describe the audit scope and deployment boundary. Installation, regression tests and CPU transcription passed on a fresh GitHub-hosted Windows runner. See the [validation record](docs/validation.md).
 
 ## License
 

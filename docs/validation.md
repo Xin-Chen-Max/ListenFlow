@@ -14,7 +14,7 @@ Tests cover retained media, saved corrections, restart interruption state, retry
 
 On 2026-10-24, the selected source directory passed 80 tests in 8.14 seconds, with one inherited TestClient/AnyIO deprecation warning. JavaScript syntax checks passed. The check reused the existing Python environment and FFmpeg installation; it was not a fresh dependency installation. Optional real-pipeline and export checks are also available in test_smoke.py.
 
-The CI workflow runs Linux regression checks and a fresh Windows installation through setup.bat, followed by launcher checks, CPU transcription and an installed-environment dependency audit. It does not validate an NVIDIA GPU, browser playback, or a physical phone. CI execution on a newly published repository is still required.
+The CI workflow runs Linux regression checks and a fresh Windows installation through setup.bat, followed by launcher checks, CPU transcription and an installed-environment dependency audit. It does not validate an NVIDIA GPU, browser playback, or a physical phone. Both jobs passed in [the published workflow run](https://github.com/Xin-Chen-Max/ListenFlow/actions/runs/40129750875).
 
 ## Browser acceptance
 
@@ -47,4 +47,13 @@ The optional human fixture comes from [AccentCL](https://github.com/PSI-TAMU/Acc
 
 ## Remaining checks
 
-Dependency remediation and the full local CUDA/browser workflow passed on 2026-10-24; the 87-test backend/smoke suite passed in 25.05 seconds, and three additional launcher tests passed. A clean Windows runner install is still pending remote execution. Real private-proxy identity requests, Android APK/device delivery, and a 120-minute locked-screen recording remain incomplete. No phone or deployment acceptance is inferred from a responsive browser screenshot. See [security notes](../SECURITY.md) for the current dependency findings.
+Dependency remediation and the full local CUDA/browser workflow passed on 2026-10-24; the 87-test backend/smoke suite passed in 25.05 seconds, and three additional launcher tests passed. Clean Windows installation passed as recorded below. Real private-proxy identity requests, Android APK/device delivery, and a 120-minute locked-screen recording remain incomplete. No phone or deployment acceptance is inferred from a responsive browser screenshot. See [security notes](../SECURITY.md) for the current dependency findings.
+
+
+## Clean Windows installation
+
+[Workflow run 40129750875](https://github.com/Xin-Chen-Max/ListenFlow/actions/runs/40129750875), source commit `c7f3b7dc232e03ccfc6696ce1a493337e8b51033`, completed successfully on 2026-10-24. The fresh GitHub-hosted VM used Windows Server 2025 (windows-2025-vs2026 image 20261021.278.1), CPython 3.12.10 and FFmpeg 9.0.2. No development-machine environment, model cache, recordings or credentials were copied to it.
+
+The Windows job installed through `setup.bat cpu --no-pause`, checked package/prerequisite compatibility, and passed 83 selected regression/launcher tests in 12.31 seconds. The real CPU/int8 tiny-model smoke check passed all three export/pipeline checks. It used the documented four-second tone fallback because that FFmpeg build lacked flite; this verifies pipeline execution and exports, not speech-recognition accuracy. The separate local CUDA speech tests provide speech/timestamp evidence.
+
+The installed Windows environment's dependency audit returned no known vulnerabilities. The Linux regression and JavaScript checks passed in the same workflow. Hosted Windows includes its standard system/build runtimes; a separate manual installation on a blank consumer Windows 11 PC was not performed.
