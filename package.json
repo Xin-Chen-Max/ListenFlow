@@ -1,0 +1,6 @@
+{
+  "name": "listenflow-browser-checks",
+  "private": true,
+  "scripts": { "test:ui": "node scripts/browser-check.cjs" },
+  "devDependencies": { "playwright": "1.62.1" }
+}

@@ -1,0 +1,1300 @@
+"use strict";
+
+// Multi-audio Local Transcriber.
+//
+// Each audio is a "job" with its own state, its own live SSE stream, a tab, and
+// a row in the status rail. Only one job is focused at a time; the focused view
+// (player, toolbar, transcript) is rendered from that job's state. Background
+// jobs keep streaming into their own state and update their tab and rail live,
+// so you can queue several files and watch them all progress.
+
+const $ = (id) => document.getElementById(id);
+
+// --- topbar / upload elements ------------------------------------------------
+const devBadge = $("devbadge"), themeToggle = $("themeToggle"), addFilesBtn = $("addFiles");
+const uploadCard = $("uploadCard");
+const libraryBtn = $("libraryBtn"), libraryView = $("libraryView"), libSearch = $("libSearch");
+const libCount = $("libCount"), libList = $("libList"), libEmpty = $("libEmpty"), libClose = $("libClose");
+const dz = $("dropzone"), fileInput = $("file"), chipsWrap = $("filechips");
+const go = $("go"), modelSel = $("model"), langSel = $("language");
+const diarizeCtl = $("diarizeCtl"), diarizeCk = $("diarize");
+
+// --- workspace / focused-view elements ---------------------------------------
+const workspace = $("workspace"), tabbar = $("tabbar");
+const railList = $("railList"), railCount = $("railCount");
+const progPanel = $("progress"), deviceEl = $("device"), statusEl = $("status");
+const retryBtn = $("retryJob");
+const elapsedEl = $("elapsed"), etaEl = $("eta"), fill = $("fill");
+const resultEl = $("result"), playerWrap = $("playerWrap"), toolbar = $("toolbar");
+const rtitle = $("rtitle"), rmeta = $("rmeta"), folderEl = $("folder");
+const transcriptEl = $("transcript");
+const searchEl = $("search"), searchCount = $("searchCount");
+const searchPrev = $("searchPrev"), searchNext = $("searchNext");
+const editToggle = $("editToggle"), copyBtn = $("copy"), copyTimesBtn = $("copyTimes");
+const aiCard = $("ai"), aiGenBtn = $("aiGen"), aiModelSel = $("aiModel");
+const aiNote = $("aiNote"), aiBody = $("aiBody");
+const listenControls = $("listenControls"), speedSel = $("playbackSpeed");
+const smartReplayBtn = $("smartReplay"), loopBtn = $("loopToggle"), loopLabel = $("loopLabel");
+const studyPanel = $("studyPanel"), savedClips = $("savedClips");
+const patternPanel = $("patternPanel"), patternList = $("patternList");
+
+// --- state -------------------------------------------------------------------
+const jobs = new Map();   // id -> job
+let activeId = null;      // focused job id
+let staged = [];          // File[] waiting for the Transcribe click
+let activeMediaEl = null; // <audio>/<video> of the focused job
+let activeMediaURL = null;
+let activeIdx = -1;       // highlighted segment index in the focused player
+let aiStatus = null;      // /api/ai/status result (Ollama availability + models)
+
+// --- helpers -----------------------------------------------------------------
+function humanSize(b) {
+  if (b < 1024) return b + " B";
+  const u = ["KB", "MB", "GB"]; let i = -1;
+  do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+  return b.toFixed(b < 10 ? 1 : 0) + " " + u[i];
+}
+function mmss(s) {
+  s = Math.max(0, Math.floor(s));
+  const m = Math.floor(s / 60), ss = s % 60;
+  return m + ":" + String(ss).padStart(2, "0");
+}
+function ts(seconds, sep) {
+  const total = Math.max(0, Math.round(seconds * 1000));
+  const h = Math.floor(total / 3600000);
+  const m = Math.floor(total / 60000) % 60;
+  const ss = Math.floor(total / 1000) % 60;
+  const ms = total % 1000;
+  const p = (n, w) => String(n).padStart(w, "0");
+  return p(h, 2) + ":" + p(m, 2) + ":" + p(ss, 2) + (sep || ",") + p(ms, 3);
+}
+function escapeHtml(t) {
+  return t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function safeStem(name) {
+  const base = (name || "transcript").replace(/\.[^.]+$/, "");
+  const clean = base.replace(/[^A-Za-z0-9 ._-]+/g, "_").trim();
+  return (clean || "transcript").slice(0, 80);
+}
+function toast(msg, isErr) {
+  let t = $("toast");
+  if (!t) {
+    t = document.createElement("div");
+    t.id = "toast";
+    t.style.cssText = "position:fixed;left:50%;bottom:28px;transform:translateX(-50%);" +
+      "background:#161a23;color:#fff;padding:10px 16px;border-radius:10px;font-size:14px;" +
+      "box-shadow:0 6px 24px rgba(0,0,0,.25);z-index:50;max-width:90vw;opacity:0;transition:opacity .2s";
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.background = isErr ? "#b42318" : "#161a23";
+  t.style.opacity = "1";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.style.opacity = "0"; }, 2600);
+}
+function shortDevice(note) { return String(note).split(" -- ")[0].trim(); }
+
+// --- theme -------------------------------------------------------------------
+function applyThemeLabel() {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  themeToggle.textContent = dark ? "Light" : "Dark";
+}
+themeToggle.addEventListener("click", () => {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  if (dark) document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", "dark");
+  try { localStorage.setItem("lt-theme", dark ? "light" : "dark"); } catch (e) {}
+  applyThemeLabel();
+});
+applyThemeLabel();
+
+// --- device badge ------------------------------------------------------------
+function applyDeviceBadge(el, note) {
+  el.textContent = shortDevice(note);
+  el.title = note;
+  el.classList.toggle("cpu", /cpu/i.test(note));
+  el.classList.remove("idle");
+}
+fetch("/api/device")
+  .then((r) => r.json())
+  .then((d) => { if (d && d.device) applyDeviceBadge(devBadge, d.device); })
+  .catch(() => { devBadge.textContent = "hardware unknown"; devBadge.classList.remove("idle"); });
+
+// Show the "Identify who spoke" toggle only when local diarization is available.
+fetch("/api/diarize/status")
+  .then((r) => r.json())
+  .then((d) => { if (d && d.available) diarizeCtl.hidden = false; })
+  .catch(() => {});
+
+// --- file staging ------------------------------------------------------------
+const NON_MEDIA = /\.(txt|pdf|docx?|xlsx?|pptx?|zip|rar|7z|gz|tar|exe|dll|msi|bat|png|jpe?g|gif|bmp|svg|webp|ico|csv|json|html?|md|py|js|css)$/i;
+
+function addStaged(fileList) {
+  const files = Array.from(fileList || []);
+  for (const f of files) {
+    if (NON_MEDIA.test(f.name)) { toast(f.name + " is not a media file, skipped.", true); continue; }
+    // de-dupe by name+size so a double drop does not stage twice
+    if (staged.some((s) => s.name === f.name && s.size === f.size)) continue;
+    staged.push(f);
+  }
+  renderChips();
+}
+function removeStaged(idx) { staged.splice(idx, 1); renderChips(); }
+function renderChips() {
+  chipsWrap.innerHTML = "";
+  chipsWrap.hidden = staged.length === 0;
+  staged.forEach((f, i) => {
+    const chip = document.createElement("span");
+    chip.className = "filechip";
+    const name = document.createElement("span");
+    name.className = "fc-name"; name.textContent = f.name;
+    const size = document.createElement("span");
+    size.className = "fc-size"; size.textContent = humanSize(f.size);
+    const x = document.createElement("button");
+    x.className = "fc-x"; x.title = "Remove"; x.setAttribute("aria-label", "Remove file");
+    x.innerHTML = "&times;";
+    x.addEventListener("click", (e) => { e.stopPropagation(); removeStaged(i); });
+    chip.appendChild(name); chip.appendChild(size); chip.appendChild(x);
+    chipsWrap.appendChild(chip);
+  });
+  go.disabled = staged.length === 0;
+  go.textContent = staged.length > 1 ? ("Transcribe " + staged.length + " files") : "Transcribe";
+}
+dz.addEventListener("click", () => fileInput.click());
+dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); } });
+fileInput.addEventListener("change", () => { addStaged(fileInput.files); fileInput.value = ""; });
+["dragenter", "dragover"].forEach((ev) =>
+  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
+["dragleave", "drop"].forEach((ev) =>
+  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
+dz.addEventListener("drop", (e) => { if (e.dataTransfer.files) addStaged(e.dataTransfer.files); });
+
+// --- upload card visibility --------------------------------------------------
+function showUploadCard(show) {
+  uploadCard.hidden = !show;
+  addFilesBtn.hidden = !(jobs.size > 0 && !show);
+}
+addFilesBtn.addEventListener("click", () => showUploadCard(true));
+
+// --- start jobs --------------------------------------------------------------
+go.addEventListener("click", () => {
+  if (!staged.length) return;
+  const model = modelSel.value, lang = langSel.value;
+  const diar = !!(diarizeCk && diarizeCk.checked && !diarizeCtl.hidden);
+  const batch = staged.slice();
+  staged = []; renderChips();
+  showUploadCard(false);
+  workspace.hidden = false;
+  let firstNewId = null;
+  for (const file of batch) {
+    const id = startJob(file, model, lang, diar);
+    if (id && !firstNewId) firstNewId = id;
+  }
+  if (firstNewId) setActive(firstNewId);
+  updateRailCount();
+});
+
+function startJob(file, model, lang, diarize) {
+  const job = {
+    id: "pending-" + Math.random().toString(36).slice(2),
+    file, name: file.name, model, lang, diarize: !!diarize,
+    status: "uploading", segments: [], duration: 0,
+    detectedLang: "", device: "", progress: 0,
+    startedAt: 0, finishedInMs: 0,
+    es: null, errorMsg: "",
+    editing: false, searchQuery: "",
+    tabEl: null, railEl: null,
+  };
+  jobs.set(job.id, job);
+  addTabAndRail(job);
+
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("model", model);
+  fd.append("language", lang);
+  fd.append("diarize", diarize ? "true" : "false");
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/jobs");
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      job.uploadPct = Math.round((e.loaded / e.total) * 100);
+      if (job.status === "uploading") { updateTab(job); updateRail(job); if (job.id === activeId) renderStatusLine(job); }
+    }
+  };
+  xhr.onload = () => {
+    if (xhr.status !== 200) { failJob(job, serverError(xhr)); return; }
+    let data; try { data = JSON.parse(xhr.responseText); } catch (e) { failJob(job, "Bad server response."); return; }
+    // Re-key the job under the real server id.
+    const realId = data.job_id;
+    jobs.delete(job.id);
+    const wasActive = activeId === job.id;
+    job.id = realId;
+    job.storageId = realId;
+    jobs.set(realId, job);
+    if (wasActive) activeId = realId;
+    streamJob(job);
+  };
+  xhr.onerror = () => failJob(job, "Upload error (is the server running?).");
+  xhr.send(fd);
+  return job.id;
+}
+
+function serverError(xhr) {
+  try { const j = JSON.parse(xhr.responseText); if (j && j.detail) return j.detail; } catch (e) {}
+  return "Upload failed: " + xhr.status + " " + (xhr.statusText || "");
+}
+
+// --- per-job SSE -------------------------------------------------------------
+function streamJob(job) {
+  const es = new EventSource("/api/jobs/" + (job.storageId || job.id) + "/events");
+  job.es = es;
+  es.onmessage = (e) => {
+    let ev; try { ev = JSON.parse(e.data); } catch (err) { return; }
+    handleEvent(job, ev);
+  };
+  es.addEventListener("end", () => { es.close(); job.es = null; });
+  es.onerror = () => { /* keep partial transcript; the end event closes us normally */ };
+}
+
+function handleEvent(job, ev) {
+  let rerenderForSpeakers = false;
+  if (ev.type === "queued") {
+    job.status = "queued";
+  } else if (ev.type === "status") {
+    if (job.status === "queued" || job.status === "uploading") {
+      job.status = "running";
+      if (!job.startedAt) job.startedAt = Date.now();
+    }
+    if (ev.device) job.device = ev.device;
+    job.statusMsg = ev.message || "";
+  } else if (ev.type === "language") {
+    job.detectedLang = ev.language || "";
+    job.statusMsg = "Detected language: " + (ev.language || "?") +
+      " (" + Math.round((ev.probability || 0) * 100) + "%)";
+  } else if (ev.type === "segment") {
+    if (!job.startedAt) job.startedAt = Date.now();
+    job.status = "running";
+    job.progress = ev.progress || 0;
+    const seg = { start: ev.start, end: ev.end, text: ev.text, words: ev.words || [] };
+    job.segments.push(seg);
+    if (job.id === activeId) appendSegmentDOM(job, seg);
+  } else if (ev.type === "done") {
+    job.status = "done";
+    job.progress = 1;
+    if (ev.duration) job.duration = ev.duration;
+    if (job.startedAt) job.finishedInMs = Date.now() - job.startedAt;
+    job.speakers = ev.speakers || 0;
+    if (Array.isArray(ev.segments) && ev.segments.length) {
+      if (!job.segments.length) {
+        job.segments = ev.segments.map((s) => ({
+          start: s.start, end: s.end, text: s.text, words: s.words || [],
+          speaker: (s.speaker != null ? s.speaker : null),
+        }));
+      } else if (job.speakers > 0) {
+        // Speakers are known only at the end; merge them onto the streamed segments.
+        ev.segments.forEach((s, i) => {
+          const seg = job.segments[i];
+          if (seg && s.speaker != null) {
+            seg.speaker = s.speaker;
+            if (seg.words && s.words) seg.words.forEach((w, j) => {
+              if (s.words[j] && s.words[j].speaker != null) w.speaker = s.words[j].speaker;
+            });
+          }
+        });
+      }
+    }
+    if (job.tabEl) {
+      job.tabEl.classList.add("just-done");
+      setTimeout(() => { if (job.tabEl) job.tabEl.classList.remove("just-done"); }, 950);
+    }
+    if (job.id === activeId && job.speakers > 0) rerenderForSpeakers = true;
+    fetchFolder(job);
+    job.storageId = job.storageId || job.id;
+    job.mediaUrl = "/api/library/" + encodeURIComponent(job.storageId) + "/media";
+    loadStudy(job);
+  } else if (ev.type === "error") {
+    failJob(job, ev.message || "Transcription failed.");
+    return;
+  }
+  updateTab(job);
+  updateRail(job);
+  updateRailCount();
+  if (job.id === activeId) { if (rerenderForSpeakers) renderActive(); else renderFocusLive(job); }
+}
+
+function failJob(job, msg) {
+  if (job.es) { job.es.close(); job.es = null; }
+  job.status = "error";
+  job.errorMsg = msg;
+  updateTab(job);
+  updateRail(job);
+  updateRailCount();
+  if (job.id === activeId) renderFocusLive(job);
+}
+
+function fetchFolder(job) {
+  job.folder = "Saved on this computer. Reopen it from Library.";
+  if (job.id === activeId) folderEl.textContent = job.folder;
+}
+
+retryBtn.addEventListener("click", async () => {
+  const job = jobs.get(activeId); if (!job || job.status !== "error") return;
+  retryBtn.disabled = true;
+  try {
+    if (!job.storageId) {
+      if (!job.file) throw new Error("Choose the source file again.");
+      const id = startJob(job.file, job.model, job.lang, job.diarize);
+      closeJob(job.id); setActive(id); return;
+    }
+    const res = await fetch("/api/jobs/" + encodeURIComponent(job.storageId) + "/retry", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Retry failed.");
+    job.status = "queued"; job.segments = []; job.errorMsg = ""; job.progress = 0;
+    job.startedAt = 0; job.finishedInMs = 0; job.editing = false;
+    renderActive(); updateTab(job); updateRail(job); updateRailCount(); streamJob(job);
+  } catch (e) { toast(e.message || "Retry failed.", true); }
+  finally { retryBtn.disabled = false; }
+});
+
+// --- tabs + rail -------------------------------------------------------------
+function statusLabel(job) {
+  if (job.status === "uploading") return "uploading " + (job.uploadPct || 0) + "%";
+  if (job.status === "queued") return "queued";
+  if (job.status === "running") return Math.round((job.progress || 0) * 100) + "%";
+  if (job.status === "done") return "done";
+  if (job.status === "error") return "error";
+  return job.status;
+}
+function addTabAndRail(job) {
+  // tab
+  const tab = document.createElement("button");
+  tab.className = "tab";
+  tab.setAttribute("role", "tab");
+  tab.innerHTML =
+    '<span class="tab-dot"></span>' +
+    '<span class="tab-name"></span>' +
+    '<span class="tab-pct"></span>' +
+    '<span class="tab-x" title="Close" aria-label="Close">&times;</span>';
+  tab.querySelector(".tab-name").textContent = job.name;
+  tab.title = job.name;
+  tab.addEventListener("click", (e) => {
+    if (e.target.classList.contains("tab-x")) { e.stopPropagation(); closeJob(job.id); return; }
+    setActive(job.id);
+  });
+  tabbar.appendChild(tab);
+  job.tabEl = tab;
+
+  // rail row
+  const row = document.createElement("div");
+  row.className = "rail-row";
+  row.innerHTML =
+    '<span class="rail-dot"></span>' +
+    '<span class="rail-name"></span>' +
+    '<span class="rail-bar"><span class="rail-fill"></span></span>' +
+    '<span class="rail-meta"></span>';
+  row.querySelector(".rail-name").textContent = job.name;
+  row.title = job.name;
+  row.addEventListener("click", () => setActive(job.id));
+  railList.appendChild(row);
+  job.railEl = row;
+
+  updateTab(job);
+  updateRail(job);
+  updateRailCount();
+}
+function updateTab(job) {
+  const t = job.tabEl; if (!t) return;
+  t.dataset.status = job.status;
+  t.classList.toggle("active", job.id === activeId);
+  const pct = t.querySelector(".tab-pct");
+  if (job.status === "running") pct.textContent = Math.round((job.progress || 0) * 100) + "%";
+  else if (job.status === "uploading") pct.textContent = (job.uploadPct || 0) + "%";
+  else pct.textContent = "";
+  pct.classList.toggle("spin", job.status === "queued");
+  if (job.status === "queued") pct.textContent = "...";
+}
+function updateRail(job) {
+  const r = job.railEl; if (!r) return;
+  r.dataset.status = job.status;
+  r.classList.toggle("active", job.id === activeId);
+  const p = job.status === "done" ? 1 : (job.status === "running" ? (job.progress || 0) : 0);
+  r.querySelector(".rail-fill").style.width = Math.round(p * 100) + "%";
+  r.querySelector(".rail-meta").textContent = statusLabel(job);
+}
+function updateRailCount() {
+  const n = jobs.size;
+  const vals = Array.from(jobs.values());
+  const done = vals.filter((j) => j.status === "done").length;
+  railCount.textContent = n ? (done + " / " + n + " done") : "";
+  // Drive the topbar live-equalizer: on whenever any job is in flight.
+  const busy = vals.some((j) => j.status === "uploading" || j.status === "queued" || j.status === "running");
+  document.body.classList.toggle("busy", busy);
+}
+function closeJob(id, force) {
+  const job = jobs.get(id); if (!job) return;
+  if (job.dirty && !force) { setActive(id); toast("Save your edits before closing this recording.", true); return; }
+  if (job.es) { try { job.es.close(); } catch (e) {} }
+  if (job.tabEl) job.tabEl.remove();
+  if (job.railEl) job.railEl.remove();
+  jobs.delete(id);
+  if (activeId === id) {
+    if (activeMediaEl) { activeMediaEl.pause(); activeMediaEl.removeAttribute("src"); activeMediaEl.load(); }
+    activeId = null;
+    const next = jobs.size ? Array.from(jobs.keys())[jobs.size - 1] : null;
+    if (next) setActive(next);
+    else { workspace.hidden = true; showUploadCard(true); }
+  }
+  updateRailCount();
+}
+
+// --- focused view ------------------------------------------------------------
+function setActive(id) {
+  const job = jobs.get(id); if (!job) return;
+  activeId = id;
+  jobs.forEach((j) => { if (j.tabEl) j.tabEl.classList.toggle("active", j.id === id); if (j.railEl) j.railEl.classList.toggle("active", j.id === id); });
+  renderActive();
+}
+
+function renderActive() {
+  const job = jobs.get(activeId);
+  // tear down previous player
+  if (activeMediaEl) { activeMediaEl.pause(); activeMediaEl.removeAttribute("src"); activeMediaEl.load(); }
+  if (activeMediaURL) { URL.revokeObjectURL(activeMediaURL); activeMediaURL = null; }
+  playerWrap.innerHTML = ""; playerWrap.hidden = true; activeMediaEl = null; activeIdx = -1;
+  curWordEl = null;
+  transcriptEl.innerHTML = ""; transcriptEl.classList.remove("editing");
+  if (!job) { resultEl.hidden = true; progPanel.hidden = true; return; }
+
+  resultEl.hidden = false;
+
+  // transcript body (rebuild from state)
+  rtitle.textContent = job.status === "done" ? ("Transcript: " + job.name) : job.name;
+  folderEl.textContent = job.folder || (job.fromLibrary ? "Saved on this computer." : "");
+  job.segments.forEach((seg) => transcriptEl.appendChild(makeSegEl(job, seg)));
+  // While a fresh job is spinning up, show a shimmer skeleton until the first segment.
+  if (!job.segments.length && (job.status === "uploading" || job.status === "queued" || job.status === "running")) {
+    transcriptEl.innerHTML = skeletonHTML();
+  }
+
+  // player (only for the focused job)
+  buildPlayer(job);
+
+  // toolbar visible once there is anything to act on
+  toolbar.hidden = job.segments.length === 0;
+  editToggle.setAttribute("aria-pressed", job.editing ? "true" : "false");
+  editToggle.textContent = job.editing ? "Save edits" : "Edit";
+  transcriptEl.classList.toggle("editing", job.editing);
+  job.segments.forEach((s) => { if (s.textEl) s.textEl.contentEditable = job.editing ? "true" : "false"; });
+  searchEl.value = job.searchQuery || "";
+  runSearch(job.searchQuery || "");
+
+  renderAi(job);
+  renderStudy(job);
+  renderFocusLive(job);
+}
+
+// Update the progress panel + meta for the focused job without rebuilding DOM.
+function renderFocusLive(job) {
+  if (!job || job.id !== activeId) return;
+  renderStatusLine(job);
+  retryBtn.hidden = job.status !== "error";
+  editToggle.disabled = job.status !== "done";
+  if (job.status === "done") {
+    progPanel.hidden = true;
+    const count = job.segments.length;
+    const dur = job.duration || (job.segments.length ? job.segments[job.segments.length - 1].end : 0);
+    const bits = [count + " segment" + (count === 1 ? "" : "s"), mmss(dur) + " of audio"];
+    if (job.finishedInMs) bits.push("done in " + mmss(job.finishedInMs / 1000));
+    if (job.detectedLang) bits.unshift(job.detectedLang.toUpperCase());
+    rmeta.textContent = bits.join("  ·  ");
+    rtitle.textContent = "Transcript: " + job.name;
+    toolbar.hidden = job.segments.length === 0;
+  } else if (job.status === "error") {
+    progPanel.hidden = false;
+    fill.classList.remove("indet"); fill.style.width = "0";
+    statusEl.innerHTML = '<span class="err">' + escapeHtml(job.errorMsg || "Failed.") + "</span>";
+    etaEl.textContent = ""; rmeta.textContent = "";
+  } else {
+    // uploading / queued / running
+    progPanel.hidden = false;
+    toolbar.hidden = job.segments.length === 0;
+  }
+  renderAi(job);
+}
+
+function renderStatusLine(job) {
+  if (job.device) { deviceEl.textContent = shortDevice(job.device); deviceEl.title = job.device; deviceEl.classList.toggle("cpu", /cpu/i.test(job.device)); }
+  else { deviceEl.textContent = "preparing..."; }
+  if (job.status === "uploading") {
+    fill.classList.add("indet"); fill.style.width = "";
+    statusEl.textContent = "Uploading " + (job.uploadPct || 0) + "%"; etaEl.textContent = "";
+  } else if (job.status === "queued") {
+    fill.classList.add("indet"); fill.style.width = "";
+    statusEl.textContent = "Queued, waiting for a free worker..."; etaEl.textContent = "";
+  } else if (job.status === "running") {
+    const p = job.progress || 0;
+    if (p > 0) { fill.classList.remove("indet"); fill.style.width = Math.round(p * 100) + "%"; }
+    else { fill.classList.add("indet"); fill.style.width = ""; }
+    statusEl.textContent = job.statusMsg || ("Transcribing " + Math.round(p * 100) + "%");
+    showEta(job);
+  }
+}
+function showEta(job) {
+  const p = job.progress || 0;
+  if (!job.startedAt || p <= 0.02 || p >= 1) { etaEl.textContent = ""; return; }
+  const elapsed = (Date.now() - job.startedAt) / 1000;
+  const remaining = elapsed * (1 - p) / p;
+  etaEl.textContent = "~" + mmss(remaining) + " left";
+}
+
+// A single ticker refreshes the focused job's elapsed clock + rail meta.
+setInterval(() => {
+  const job = jobs.get(activeId);
+  if (job && job.status === "running" && job.startedAt) {
+    elapsedEl.textContent = mmss((Date.now() - job.startedAt) / 1000);
+  }
+}, 500);
+
+// --- transcript rendering (focused job) --------------------------------------
+// Shimmer placeholder shown while a job spins up and no segments have arrived.
+function skeletonHTML() {
+  const row =
+    '<div class="sk-row"><div class="sk-time"></div>' +
+    '<div class="sk-lines"><div class="sk-line"></div><div class="sk-line short"></div></div></div>';
+  return '<div class="skeleton" aria-hidden="true">' + row + row + row + "</div>";
+}
+// Fill a segment's text node. When idle it renders one span per word so the
+// current word can be highlighted during playback; while editing or searching it
+// falls back to plain text (search paints its own <mark>s over the top).
+function paintSegText(seg, job) {
+  const el = seg.textEl;
+  if (!el) return;
+  const searching = !!(job.searchQuery && job.searchQuery.trim());
+  if (job.editing || searching || !(seg.words && seg.words.length)) {
+    el.textContent = seg.text;
+    seg.wordEls = null;
+    return;
+  }
+  el.innerHTML = seg.words
+    .map((w, i) => '<span class="w" data-wi="' + i + '">' + escapeHtml(w.word) + "</span>")
+    .join("");
+  seg.wordEls = Array.prototype.slice.call(el.querySelectorAll(".w"));
+  seg.wordEls.forEach((span, i) => {
+    const w = seg.words[i];
+    if ((job.patterns || []).some((p) => p.timing === "words" && w.start >= p.start && w.end <= p.end)) {
+      span.classList.add("pattern-word"); span.title = "Possible connected-speech pattern; not confirmed in audio";
+    }
+  });
+}
+function makeSegEl(job, seg) {
+  const row = document.createElement("div");
+  row.className = "seg";
+  const t = document.createElement("span");
+  t.className = "t"; t.textContent = mmss(seg.start); t.title = "Jump to " + mmss(seg.start);
+  const text = document.createElement("span");
+  text.className = "seg-text";
+  text.contentEditable = job.editing ? "true" : "false";
+  row.appendChild(t);
+  if (seg.speaker != null) {
+    const chip = document.createElement("span");
+    chip.className = "spk spk-" + (((seg.speaker % 8) + 8) % 8);
+    chip.textContent = "Speaker " + (seg.speaker + 1);
+    row.appendChild(chip);
+  }
+  row.appendChild(text);
+  const actions = document.createElement("span"); actions.className = "seg-actions";
+  for (const [label, action] of [
+    ["Save clip", () => saveClip(job, job.segments.indexOf(seg))],
+    ["Patterns", () => showPatterns(job, job.segments.indexOf(seg))],
+  ]) {
+    const button = document.createElement("button"); button.className = "mini"; button.textContent = label;
+    button.addEventListener("click", (e) => { e.stopPropagation(); action(); }); actions.appendChild(button);
+  }
+  row.appendChild(actions);
+  seg.el = row; seg.textEl = text;
+  paintSegText(seg, job);
+  t.addEventListener("click", (e) => { e.stopPropagation(); seekTo(seg.start); });
+  row.addEventListener("click", () => { if (!job.editing) seekTo(seg.start); });
+  text.addEventListener("input", () => {
+    seg.text = text.textContent; seg.words = []; seg.wordEls = null; job.dirty = true;
+  });
+  return row;
+}
+function appendSegmentDOM(job, seg) {
+  // Decide before adding content: reading older text must not pull us to the end.
+  const previousTop = transcriptEl.scrollTop;
+  const nearBottom = transcriptEl.scrollHeight - transcriptEl.clientHeight - previousTop <= 48;
+  const selection = window.getSelection();
+  const selectingText = selection && !selection.isCollapsed &&
+    (transcriptEl.contains(selection.anchorNode) || transcriptEl.contains(selection.focusNode));
+  const followNewText = nearBottom && !selectingText && !job.editing &&
+    !(job.searchQuery || "").trim() && (!activeMediaEl || activeMediaEl.paused);
+  // First real segment clears the shimmer skeleton.
+  if (transcriptEl.querySelector(".skeleton")) transcriptEl.innerHTML = "";
+  transcriptEl.appendChild(makeSegEl(job, seg));
+  if (seg.el) seg.el.classList.add("fresh");
+  transcriptEl.scrollTop = followNewText ? transcriptEl.scrollHeight : previousTop;
+  if (toolbar.hidden) toolbar.hidden = false;
+}
+
+// --- media player + sync (focused job) ---------------------------------------
+function isVideoFile(f) {
+  if (f.type && f.type.startsWith("video")) return true;
+  if (f.type && f.type.startsWith("audio")) return false;
+  return /\.(mp4|mov|mkv|webm|avi|m4v|mpg|mpeg|ogv|ts|3gp)$/i.test(f.name);
+}
+function buildPlayer(job) {
+  playerWrap.innerHTML = ""; activeMediaEl = null;
+  listenControls.hidden = true;
+  if (!job || (!job.file && !job.mediaUrl)) {
+    playerWrap.hidden = false;
+    playerWrap.textContent = "Audio is unavailable for this older transcript. Upload the recording again to practice.";
+    return;
+  }
+  const el = document.createElement(isVideoFile(job.file || { name: job.name }) ? "video" : "audio");
+  el.id = "player"; el.controls = true; el.preload = "metadata";
+  if (job.file) { activeMediaURL = URL.createObjectURL(job.file); el.src = activeMediaURL; }
+  else { el.src = job.mediaUrl; }
+  el.addEventListener("timeupdate", onTimeUpdate);
+  el.addEventListener("error", () => {
+    playerWrap.innerHTML =
+      '<div class="player-note">Preview is not available for this file format in the browser. ' +
+      "Transcription, editing, and export still work.</div>";
+    activeMediaEl = null;
+    listenControls.hidden = true;
+  });
+  playerWrap.appendChild(el);
+  playerWrap.hidden = false;
+  activeMediaEl = el;
+  listenControls.hidden = false;
+  speedSel.value = String(job.playbackRate || 1);
+  el.playbackRate = Number(speedSel.value);
+  updateLoopLabel(job);
+  el.addEventListener("ended", () => {
+    if (job.playRange && job.playRange.loop) { el.currentTime = job.playRange.start; el.play().catch(() => {}); }
+  });
+}
+function seekTo(t) {
+  if (!activeMediaEl) return;
+  const job = jobs.get(activeId);
+  if (job) {
+    job.playRange = null;
+    if (job.loopEnabled) {
+      const ranges = practiceRanges(job);
+      const seg = ranges[rangeAt(ranges, t)];
+      if (seg) job.playRange = { start: seg.start, end: seg.end, loop: true };
+    }
+    updateLoopLabel(job);
+  }
+  try { activeMediaEl.currentTime = Math.max(0, t); activeMediaEl.play().catch(() => {}); } catch (e) {}
+}
+let curWordEl = null;  // the word span currently lit for karaoke
+function highlightWord(job, segIdx, t) {
+  const seg = segIdx >= 0 ? job.segments[segIdx] : null;
+  let el = null;
+  if (seg && seg.wordEls && seg.words && seg.words.length) {
+    let wi = -1;
+    for (let i = 0; i < seg.words.length; i++) {
+      if (seg.words[i].start <= t + 0.05) wi = i; else break;
+    }
+    // drop the highlight once we are clearly past the last spoken word
+    if (wi >= 0 && t <= seg.words[wi].end + 0.4) el = seg.wordEls[wi];
+  }
+  if (el === curWordEl) return;
+  if (curWordEl) curWordEl.classList.remove("wnow");
+  curWordEl = el;
+  if (el) el.classList.add("wnow");
+}
+function onTimeUpdate() {
+  const job = jobs.get(activeId);
+  if (!activeMediaEl || !job || !job.segments.length) return;
+  const t = activeMediaEl.currentTime;
+  const range = job.playRange;
+  if (range && t >= range.end - 0.025) {
+    if (range.loop) { activeMediaEl.currentTime = range.start; activeMediaEl.play().catch(() => {}); }
+    else { activeMediaEl.pause(); activeMediaEl.currentTime = range.end; job.playRange = null; }
+    return;
+  }
+  let idx = -1;
+  for (let i = 0; i < job.segments.length; i++) {
+    if (job.segments[i].start <= t + 0.001) idx = i; else break;
+  }
+  highlightWord(job, idx, t);  // per-word karaoke, updates even within one segment
+  if (idx === activeIdx) return;
+  if (activeIdx >= 0 && job.segments[activeIdx] && job.segments[activeIdx].el) job.segments[activeIdx].el.classList.remove("active");
+  activeIdx = idx;
+  if (idx >= 0 && job.segments[idx] && job.segments[idx].el) {
+    job.segments[idx].el.classList.add("active");
+    if (!activeMediaEl.paused) job.segments[idx].el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+}
+
+// --- listening practice ----------------------------------------------------
+function practiceRanges(job) {
+  const ranges = [];
+  let current = null;
+  const flush = () => { if (current && current.end > current.start) ranges.push(current); current = null; };
+  job.segments.forEach((seg) => {
+    if (!(seg.words || []).length) {
+      flush(); if (seg.end > seg.start) ranges.push({ start: seg.start, end: seg.end }); return;
+    }
+    seg.words.forEach((word) => {
+      if (current && word.start - current.end > 1.5) flush();
+      if (!current) current = { start: word.start, end: word.end };
+      current.end = word.end;
+      if (/[.!?]["')\]]*$/.test(word.word.trim())) flush();
+    });
+  });
+  flush(); return ranges;
+}
+function rangeAt(ranges, time) {
+  let index = 0;
+  ranges.forEach((s, i) => { if (s.start <= time) index = i; });
+  return index;
+}
+function updateLoopLabel(job) {
+  loopBtn.setAttribute("aria-pressed", job.loopEnabled ? "true" : "false");
+  loopBtn.textContent = job.loopEnabled ? "Stop looping" : "Loop current phrase";
+  loopLabel.textContent = job.playRange && job.playRange.loop
+    ? ("Loop: " + mmss(job.playRange.start) + "–" + mmss(job.playRange.end)) : "";
+}
+function replayRange(job, start, end) {
+  if (job.id !== activeId || !activeMediaEl) { toast("Audio is unavailable for this recording.", true); return; }
+  if (!(end > start)) { toast("This phrase has no playable duration.", true); return; }
+  job.playRange = { start, end, loop: !!job.loopEnabled };
+  updateLoopLabel(job);
+  activeMediaEl.currentTime = start;
+  activeMediaEl.play().catch(() => toast("Press play to hear this phrase."));
+}
+speedSel.addEventListener("change", () => {
+  const job = jobs.get(activeId); if (!job || !activeMediaEl) return;
+  job.playbackRate = Number(speedSel.value); activeMediaEl.playbackRate = job.playbackRate;
+});
+smartReplayBtn.addEventListener("click", () => {
+  const job = jobs.get(activeId); if (!job || !activeMediaEl || !job.segments.length) return;
+  const time = activeMediaEl.currentTime;
+  const ranges = practiceRanges(job); if (!ranges.length) return;
+  let index = rangeAt(ranges, time);
+  // A click just after a phrase boundary usually refers to what was just heard.
+  if (index > 0 && time - ranges[index].start < 1) index--;
+  const seg = ranges[index]; replayRange(job, seg.start, seg.end);
+});
+loopBtn.addEventListener("click", () => {
+  const job = jobs.get(activeId); if (!job || !activeMediaEl || !job.segments.length) return;
+  job.loopEnabled = !job.loopEnabled;
+  if (job.loopEnabled) {
+    const ranges = practiceRanges(job); if (!ranges.length) { job.loopEnabled = false; return; }
+    const range = job.playRange || ranges[rangeAt(ranges, activeMediaEl.currentTime)];
+    replayRange(job, range.start, range.end);
+  } else { job.playRange = null; updateLoopLabel(job); }
+});
+
+async function loadStudy(job) {
+  if (!job.storageId || job.status !== "done") return;
+  try {
+    const [itemRes, patternRes] = await Promise.all([
+      fetch("/api/library/" + encodeURIComponent(job.storageId)),
+      fetch("/api/library/" + encodeURIComponent(job.storageId) + "/patterns"),
+    ]);
+    if (!itemRes.ok || !patternRes.ok) throw new Error("Practice data is unavailable.");
+    const item = await itemRes.json(), data = await patternRes.json();
+    job.clips = item.clips || []; job.patterns = data.patterns || []; job.studyLoaded = true;
+    if (job.id === activeId) {
+      job.segments.forEach((seg) => { if (!job.editing && !job.searchQuery) paintSegText(seg, job); });
+      renderStudy(job);
+    }
+  } catch (e) { if (job.id === activeId) toast(e.message, true); }
+}
+async function saveClip(job, index) {
+  if (job.dirty || job.editing) { toast("Save your transcript edits before practicing this phrase."); return; }
+  if (job.status !== "done") { toast("Finish transcription before saving a clip."); return; }
+  try {
+    const res = await fetch("/api/library/" + encodeURIComponent(job.storageId) + "/clips", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ segment_index: index }),
+    });
+    const clip = await res.json();
+    if (!res.ok) throw new Error(clip.detail || "Could not save clip.");
+    job.clips = (job.clips || []).filter((c) => c.id !== clip.id).concat([clip]).sort((a, b) => a.start - b.start);
+    if (job.id === activeId) renderStudy(job);
+    toast("Clip saved for practice.");
+  } catch (e) { toast(e.message || "Could not save clip.", true); }
+}
+async function removeClip(job, clip) {
+  try {
+    const res = await fetch("/api/library/" + encodeURIComponent(job.storageId) + "/clips/" + encodeURIComponent(clip.id), { method: "DELETE" });
+    if (!res.ok) throw new Error("Could not remove clip.");
+    job.clips = job.clips.filter((c) => c.id !== clip.id);
+    if (job.id === activeId) renderStudy(job);
+  } catch (e) { toast(e.message, true); }
+}
+function practiceButton(label, action) {
+  const button = document.createElement("button"); button.className = "btn ghost";
+  button.textContent = label; button.addEventListener("click", action); return button;
+}
+async function showPatterns(job, index) {
+  if (job.dirty || job.editing) { toast("Save your transcript edits before exploring patterns."); return; }
+  if (job.status !== "done") { toast("Finish transcription before exploring patterns."); return; }
+  if (!job.studyLoaded) await loadStudy(job);
+  job.patternSegment = index;
+  renderStudy(job); patternPanel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+function renderStudy(job) {
+  studyPanel.hidden = !job || job.status !== "done";
+  if (studyPanel.hidden) return;
+  savedClips.innerHTML = "";
+  if (!(job.clips || []).length) {
+    const hint = document.createElement("p"); hint.className = "study-note";
+    hint.textContent = "Choose Save clip beside a transcript phrase to practice it later."; savedClips.appendChild(hint);
+  }
+  (job.clips || []).forEach((clip) => {
+    const row = document.createElement("div"); row.className = "practice-clip";
+    const text = document.createElement("span"); text.textContent = mmss(clip.start) + " · " + clip.text;
+    row.append(text, practiceButton("Replay clip", () => replayRange(job, clip.start, clip.end)),
+      practiceButton("Remove clip", () => removeClip(job, clip))); savedClips.appendChild(row);
+  });
+  patternPanel.hidden = job.patternSegment == null;
+  patternList.innerHTML = "";
+  const patterns = (job.patterns || []).filter((p) => p.segment_index === job.patternSegment);
+  if (!patterns.length) {
+    const hint = document.createElement("p"); hint.className = "study-note";
+    hint.textContent = "No supported text-rule candidate in this phrase. You can still replay it and listen for connections.";
+    patternList.appendChild(hint);
+  }
+  patterns.forEach((pattern) => {
+    const card = document.createElement("div"); card.className = "pattern-card";
+    const label = document.createElement("strong"); label.textContent = pattern.label + " · " + pattern.category;
+    const phrase = document.createElement("p"); phrase.className = "pattern-phrase"; phrase.textContent = pattern.phrase;
+    const explanation = document.createElement("p"); explanation.textContent = pattern.explanation;
+    const accent = document.createElement("p"); accent.className = "study-note"; accent.textContent = pattern.accent_note;
+    card.append(label, phrase, explanation, accent,
+      practiceButton(pattern.timing === "words" ? "Replay phrase" : "Replay segment", () => replayRange(job, pattern.start, pattern.end)));
+    patternList.appendChild(card);
+  });
+}
+
+// --- search (focused job) ----------------------------------------------------
+let matches = [], matchIndex = -1;
+function clearHighlights(job) {
+  if (curWordEl) { curWordEl.classList.remove("wnow"); curWordEl = null; }
+  job.segments.forEach((s) => { if (s.textEl) paintSegText(s, job); });
+  matches = []; matchIndex = -1;
+}
+function runSearch(q) {
+  const job = jobs.get(activeId); if (!job) return;
+  job.searchQuery = q || "";
+  clearHighlights(job);
+  q = (q || "").trim();
+  if (!q) { searchCount.textContent = ""; searchPrev.hidden = searchNext.hidden = true; return; }
+  const ql = q.toLowerCase();
+  job.segments.forEach((s) => {
+    if (!s.textEl) return;
+    const text = s.text, low = text.toLowerCase();
+    if (low.indexOf(ql) === -1) return;
+    let html = "", i = 0, idx;
+    while ((idx = low.indexOf(ql, i)) !== -1) {
+      html += escapeHtml(text.slice(i, idx));
+      html += '<mark class="hit">' + escapeHtml(text.slice(idx, idx + q.length)) + "</mark>";
+      i = idx + q.length;
+    }
+    html += escapeHtml(text.slice(i));
+    s.textEl.innerHTML = html;
+    s.textEl.querySelectorAll("mark.hit").forEach((m) => matches.push(m));
+  });
+  searchCount.textContent = matches.length
+    ? (matches.length + " match" + (matches.length > 1 ? "es" : ""))
+    : "no matches";
+  searchPrev.hidden = searchNext.hidden = matches.length < 2;
+  if (matches.length) { matchIndex = 0; focusMatch(); }
+}
+function focusMatch() {
+  matches.forEach((m) => m.classList.remove("current"));
+  const m = matches[matchIndex];
+  if (!m) return;
+  m.classList.add("current");
+  m.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+searchEl.addEventListener("input", () => runSearch(searchEl.value));
+searchEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && matches.length) {
+    e.preventDefault();
+    matchIndex = (matchIndex + (e.shiftKey ? -1 : 1) + matches.length) % matches.length;
+    focusMatch();
+  }
+});
+searchNext.addEventListener("click", () => { if (matches.length) { matchIndex = (matchIndex + 1) % matches.length; focusMatch(); } });
+searchPrev.addEventListener("click", () => { if (matches.length) { matchIndex = (matchIndex - 1 + matches.length) % matches.length; focusMatch(); } });
+
+// --- edit (focused job) ------------------------------------------------------
+editToggle.addEventListener("click", async () => {
+  const job = jobs.get(activeId); if (!job) return;
+  if (job.editing) {
+    editToggle.disabled = true;
+    try {
+      const res = await fetch("/api/library/" + encodeURIComponent(job.storageId || job.id), {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texts: job.segments.map((s) => s.text) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Could not save edits.");
+      data.segments.forEach((s, i) => { job.segments[i].text = s.text; job.segments[i].words = s.words || []; });
+      job.dirty = false;
+      loadStudy(job);
+      toast("Edits saved.");
+    } catch (e) { toast(e.message || "Could not save edits. Your changes are still open.", true); return; }
+    finally { editToggle.disabled = false; }
+  }
+  job.editing = !job.editing;
+  editToggle.setAttribute("aria-pressed", job.editing ? "true" : "false");
+  editToggle.textContent = job.editing ? "Save edits" : "Edit";
+  transcriptEl.classList.toggle("editing", job.editing);
+  if (job.editing && searchEl.value) { searchEl.value = ""; runSearch(""); }
+  job.segments.forEach((s) => {
+    if (s.textEl) { s.textEl.contentEditable = job.editing ? "true" : "false"; paintSegText(s, job); }
+  });
+});
+
+window.addEventListener("beforeunload", (event) => {
+  if (Array.from(jobs.values()).some((job) => job.dirty)) { event.preventDefault(); event.returnValue = ""; }
+});
+
+// --- exports + copy (focused job) --------------------------------------------
+function plainSegments(job) { return job.segments.map((s) => ({ start: s.start, end: s.end, text: (s.text || "").trim() })); }
+function buildTxt(segs) { return segs.map((s) => s.text).join("\n").trim() + "\n"; }
+function buildTextWithTimes(segs) { return segs.map((s) => "[" + mmss(s.start) + "] " + s.text).join("\n").trim() + "\n"; }
+function buildSrt(segs) {
+  const out = [];
+  segs.forEach((s, i) => { out.push(String(i + 1), ts(s.start) + " --> " + ts(s.end), s.text, ""); });
+  return out.join("\n");
+}
+function buildVtt(segs) {
+  const out = ["WEBVTT", ""];
+  segs.forEach((s) => { out.push(ts(s.start, ".") + " --> " + ts(s.end, "."), s.text, ""); });
+  return out.join("\n");
+}
+function buildMd(segs, title) {
+  const out = ["# " + title, ""];
+  segs.forEach((s) => { out.push("**[" + mmss(s.start) + "]** " + s.text, ""); });
+  return out.join("\n").trim() + "\n";
+}
+function buildJson(segs, duration, title) {
+  return JSON.stringify({
+    title: title,
+    duration: Math.round((duration || 0) * 100) / 100,
+    segment_count: segs.length,
+    segments: segs.map((s) => ({
+      start: Math.round(s.start * 1000) / 1000,
+      end: Math.round(s.end * 1000) / 1000,
+      text: s.text,
+    })),
+  }, null, 2) + "\n";
+}
+function downloadBlob(filename, text, mime) {
+  const blob = new Blob([text], { type: mime || "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+async function exportFormat(fmt) {
+  const job = jobs.get(activeId); if (!job) return;
+  const segs = plainSegments(job);
+  const base = safeStem(job.name);
+  if (fmt === "txt") return downloadBlob(base + ".txt", buildTxt(segs));
+  if (fmt === "srt") return downloadBlob(base + ".srt", buildSrt(segs), "text/plain;charset=utf-8");
+  if (fmt === "vtt") return downloadBlob(base + ".vtt", buildVtt(segs), "text/vtt;charset=utf-8");
+  if (fmt === "md") return downloadBlob(base + ".md", buildMd(segs, base), "text/markdown;charset=utf-8");
+  if (fmt === "json") {
+    const dur = job.duration || (segs.length ? segs[segs.length - 1].end : 0);
+    return downloadBlob(base + ".json", buildJson(segs, dur, base), "application/json");
+  }
+  if (fmt === "docx") return exportDocx(segs, base);
+}
+async function exportDocx(segs, base) {
+  const btn = $("dl-docx");
+  btn.classList.add("busy");
+  try {
+    const res = await fetch("/api/export/docx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ segments: segs, title: base, with_timestamps: true }),
+    });
+    if (!res.ok) throw new Error("server " + res.status);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = base + ".docx";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  } catch (e) {
+    toast("DOCX export failed: " + e.message, true);
+  } finally {
+    btn.classList.remove("busy");
+  }
+}
+["txt", "srt", "vtt", "md", "json", "docx"].forEach((fmt) => {
+  $("dl-" + fmt).addEventListener("click", () => exportFormat(fmt));
+});
+function copyText(text, btn) {
+  navigator.clipboard.writeText(text).then(() => {
+    const old = btn.textContent;
+    btn.textContent = "Copied";
+    setTimeout(() => (btn.textContent = old), 1400);
+  }).catch(() => toast("Copy failed", true));
+}
+copyBtn.addEventListener("click", () => { const j = jobs.get(activeId); if (j) copyText(buildTxt(plainSegments(j)), copyBtn); });
+copyTimesBtn.addEventListener("click", () => { const j = jobs.get(activeId); if (j) copyText(buildTextWithTimes(plainSegments(j)), copyTimesBtn); });
+
+// --- AI insights (focused job, optional via local Ollama) --------------------
+function parseClock(t) {
+  // "M:SS" or "H:MM:SS" -> seconds; NaN if unparseable
+  const parts = String(t || "").trim().split(":").map((n) => parseInt(n, 10));
+  if (!parts.length || parts.some((n) => isNaN(n))) return NaN;
+  return parts.reduce((acc, p) => acc * 60 + p, 0);
+}
+function populateAiModels() {
+  aiModelSel.innerHTML = "";
+  const models = (aiStatus && aiStatus.models) || [];
+  if (!models.length) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "no model";
+    aiModelSel.appendChild(opt); aiModelSel.disabled = true; return;
+  }
+  aiModelSel.disabled = false;
+  models.forEach((m) => {
+    const opt = document.createElement("option");
+    opt.value = m; opt.textContent = m;
+    aiModelSel.appendChild(opt);
+  });
+  if (aiStatus.default) aiModelSel.value = aiStatus.default;
+}
+fetch("/api/ai/status").then((r) => r.json())
+  .then((d) => { aiStatus = d; populateAiModels(); })
+  .catch(() => { aiStatus = { available: false, models: [] }; populateAiModels(); });
+
+function showAiNote(html) { aiNote.innerHTML = html; aiNote.hidden = false; }
+function hideAiNote() { aiNote.hidden = true; aiNote.innerHTML = ""; }
+function aiUnavailableHtml() {
+  const where = aiStatus && aiStatus.base_url ? (" at <code>" + escapeHtml(aiStatus.base_url) + "</code>") : "";
+  return "Ollama is not running" + where + ". Start it with <code>ollama serve</code> and pull a model, " +
+    "for example <code>ollama pull qwen3:8b</code>, then reload the page.";
+}
+function aiLoading() { hideAiNote(); aiBody.hidden = false; aiBody.innerHTML = skeletonHTML(); }
+function hintToHtml(hint) {
+  // Turn 'command' quotes into <code> for readability.
+  return escapeHtml(hint).replace(/&#39;([^&]+?)&#39;|'([^']+?)'/g, (m, a, b) => "<code>" + (a || b) + "</code>");
+}
+function renderAiResult(ai) {
+  hideAiNote();
+  const chapters = ai.chapters || [], actions = ai.actions || [];
+  let html =
+    '<div class="ai-block"><div class="ai-label"><span class="spark"></span>Summary</div>' +
+    '<p class="ai-summary">' + escapeHtml(ai.summary || "") + "</p></div>" +
+    '<div class="ai-cols"><div class="ai-block">' +
+    '<div class="ai-label"><span class="spark"></span>Chapters</div><div class="ai-chapters">';
+  if (chapters.length) {
+    chapters.forEach((c) => {
+      html += '<div class="ai-chapter" data-t="' + escapeHtml(c.time || "") + '">' +
+        '<span class="ct">' + escapeHtml(c.time || "") + "</span>" +
+        '<span class="cl">' + escapeHtml(c.title || "") + "</span></div>";
+    });
+  } else { html += '<div class="ai-empty">No chapters.</div>'; }
+  html += "</div></div><div class=\"ai-block\">" +
+    '<div class="ai-label"><span class="spark"></span>Action items</div>';
+  if (actions.length) {
+    html += '<ul class="ai-actions">' + actions.map((a) => "<li>" + escapeHtml(a) + "</li>").join("") + "</ul>";
+  } else { html += '<div class="ai-empty">None.</div>'; }
+  html += "</div></div>";
+  aiBody.innerHTML = html;
+  aiBody.hidden = false;
+  aiBody.querySelectorAll(".ai-chapter").forEach((el) => {
+    el.addEventListener("click", () => { const s = parseClock(el.dataset.t); if (!isNaN(s)) seekTo(s); });
+  });
+}
+// Render the AI panel from the active job's state (called on rebuild + on done).
+function renderAi(job) {
+  if (!job || job.status !== "done" || !job.segments.length || !aiStatus || !aiStatus.available || !aiStatus.models.length) { aiCard.hidden = true; return; }
+  aiCard.hidden = false;
+  aiGenBtn.disabled = job.aiState === "loading";
+  if (job.aiModel && [...aiModelSel.options].some((o) => o.value === job.aiModel)) aiModelSel.value = job.aiModel;
+  if (job.aiState === "loading") { aiLoading(); aiGenBtn.textContent = "Generating..."; return; }
+  if (job.ai) { renderAiResult(job.ai); aiGenBtn.textContent = "Regenerate"; return; }
+  aiBody.hidden = true; aiBody.innerHTML = "";
+  aiGenBtn.textContent = "Generate";
+  if (aiStatus && aiStatus.available === false) showAiNote(aiUnavailableHtml()); else hideAiNote();
+}
+async function generateAi() {
+  const job = jobs.get(activeId);
+  if (!job || job.status !== "done" || !job.segments.length) return;
+  const model = aiModelSel.value || "";
+  job.aiState = "loading";
+  aiLoading(); aiGenBtn.disabled = true; aiGenBtn.textContent = "Generating...";
+  try {
+    const res = await fetch("/api/ai/summarize", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ segments: plainSegments(job), model }),
+    });
+    const data = await res.json();
+    if (data && data.ok) {
+      job.ai = data; job.aiModel = data.model || model; job.aiState = "done";
+    } else {
+      job.aiState = "error"; job.aiError = (data && data.error) || "AI request failed.";
+      job.aiHint = data && data.hint ? data.hint : "";
+    }
+  } catch (e) {
+    job.aiState = "error"; job.aiError = "AI request failed: " + e.message; job.aiHint = "";
+  }
+  // Only touch the DOM if this job is still focused (the panel is shared).
+  if (activeId !== job.id) return;
+  aiGenBtn.disabled = false;
+  if (job.aiState === "done") { renderAiResult(job.ai); aiGenBtn.textContent = "Regenerate"; }
+  else {
+    aiBody.hidden = true; aiBody.innerHTML = "";
+    let msg = escapeHtml(job.aiError || "AI request failed.");
+    if (job.aiHint) msg += '<span class="ai-hint">' + hintToHtml(job.aiHint) + "</span>";
+    showAiNote(msg); aiGenBtn.textContent = "Try again";
+  }
+}
+aiGenBtn.addEventListener("click", generateAi);
+
+// --- transcript library + global search --------------------------------------
+function fmtDate(sec) {
+  try {
+    const d = new Date(sec * 1000);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) +
+      " " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  } catch (e) { return ""; }
+}
+function highlightSnippet(text, query) {
+  const esc = escapeHtml(text || "");
+  if (!query) return esc;
+  try {
+    const re = new RegExp("(" + escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
+    return esc.replace(re, "<mark>$1</mark>");
+  } catch (e) { return esc; }
+}
+function openLibrary() {
+  if (activeMediaEl) activeMediaEl.pause();
+  libraryView.hidden = false;
+  workspace.hidden = true;
+  uploadCard.hidden = true;
+  addFilesBtn.hidden = true;
+  libSearch.value = "";
+  loadLibrary("");
+  libSearch.focus();
+}
+function closeLibrary() {
+  libraryView.hidden = true;
+  if (jobs.size > 0) { workspace.hidden = false; addFilesBtn.hidden = false; }
+  else { showUploadCard(true); }
+}
+async function loadLibrary(query) {
+  try {
+    const res = await fetch("/api/library" + (query ? ("?q=" + encodeURIComponent(query)) : ""));
+    const data = await res.json();
+    const entries = (data && data.entries) || [];
+    libCount.textContent = entries.length + (entries.length === 1 ? " transcript" : " transcripts");
+    renderLibraryList(entries, query);
+  } catch (e) {
+    libCount.textContent = ""; libList.innerHTML = "";
+    libEmpty.hidden = false; libEmpty.textContent = "Could not load the library.";
+  }
+}
+function renderLibraryList(entries, query) {
+  libList.innerHTML = "";
+  libEmpty.hidden = entries.length > 0;
+  if (!entries.length) {
+    libEmpty.textContent = query
+      ? ("No transcripts match “" + query + "”.")
+      : "No transcripts yet. Transcribe something and it will appear here.";
+    return;
+  }
+  entries.forEach((e) => {
+    const meta = [fmtDate(e.created_at)];
+    if (e.status && e.status !== "done") meta.push(e.status === "error" ? "Failed — open to retry" : e.status);
+    if (e.duration) meta.push(mmss(e.duration));
+    if (e.language) meta.push(String(e.language).toUpperCase());
+    if (e.model) meta.push(e.model);
+    meta.push(e.segment_count + " seg");
+
+    const card = document.createElement("div");
+    card.className = "lib-card";
+    card.innerHTML =
+      '<div class="lib-card-top"><span class="lib-card-name"></span></div>' +
+      '<div class="lib-card-meta"></div>' +
+      '<p class="lib-card-snippet"></p>' +
+      '<button class="lib-del" title="Remove from the library">Delete</button>';
+    card.querySelector(".lib-card-name").textContent = e.name;
+    const metaEl = card.querySelector(".lib-card-meta");
+    meta.forEach((m) => { const s = document.createElement("span"); s.textContent = m; metaEl.appendChild(s); });
+    card.querySelector(".lib-card-snippet").innerHTML = highlightSnippet(e.snippet || "", query);
+    card.addEventListener("click", (ev) => {
+      if (ev.target.classList.contains("lib-del")) return;
+      openLibraryItem(e.id);
+    });
+    card.querySelector(".lib-del").addEventListener("click", (ev) => { ev.stopPropagation(); deleteLibraryItem(e.id); });
+    libList.appendChild(card);
+  });
+}
+async function openLibraryItem(id) {
+  const jid = "lib:" + id;
+  if (jobs.has(id)) { closeLibrary(); workspace.hidden = false; setActive(id); return; }
+  if (jobs.has(jid)) { closeLibrary(); workspace.hidden = false; setActive(jid); return; }
+  let d;
+  try {
+    const res = await fetch("/api/library/" + encodeURIComponent(id));
+    if (!res.ok) throw new Error("not found");
+    d = await res.json();
+  } catch (e) { toast("Could not open that transcript.", true); return; }
+  const job = {
+    id: jid, file: null, name: d.name || "transcript", model: d.model || "", lang: d.language || "",
+    storageId: id, mediaUrl: d.media_url, status: d.status || "done", segments: (d.segments || []).map((s) => ({ start: s.start, end: s.end, text: s.text, words: s.words || [], speaker: (s.speaker != null ? s.speaker : null) })),
+    duration: d.duration || 0, detectedLang: d.language || "", device: "",
+    progress: 1, startedAt: 0, finishedInMs: 0, es: null, errorMsg: d.error || "",
+    editing: false, searchQuery: "", tabEl: null, railEl: null, fromLibrary: true,
+  };
+  jobs.set(jid, job);
+  addTabAndRail(job);
+  closeLibrary();
+  workspace.hidden = false;
+  showUploadCard(false);
+  setActive(jid);
+  updateRailCount();
+  if (job.status === "queued" || job.status === "running") streamJob(job);
+  else loadStudy(job);
+}
+async function deleteLibraryItem(id) {
+  const active = jobs.get(activeId);
+  if (active && (active.storageId === id || active.id === id) && activeMediaEl) {
+    activeMediaEl.pause(); activeMediaEl.removeAttribute("src"); activeMediaEl.load(); activeMediaEl = null;
+  }
+  try {
+    const res = await fetch("/api/library/" + encodeURIComponent(id), { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Delete failed.");
+  } catch (e) { toast(e.message || "Delete failed.", true); return; }
+  const jid = "lib:" + id;
+  if (jobs.has(jid)) closeJob(jid, true);
+  if (jobs.has(id)) closeJob(id, true);
+  loadLibrary(libSearch.value.trim());
+  toast("Recording and transcript deleted.");
+}
+let libSearchTimer = null;
+libSearch.addEventListener("input", () => {
+  clearTimeout(libSearchTimer);
+  libSearchTimer = setTimeout(() => loadLibrary(libSearch.value.trim()), 220);
+});
+libraryBtn.addEventListener("click", () => { if (libraryView.hidden) openLibrary(); else closeLibrary(); });
+libClose.addEventListener("click", closeLibrary);
+
+
+// Native study links reopen the same retained recording after app/browser restart.
+const linkedRecording = new URLSearchParams(window.location.search).get("recording");
+if (linkedRecording) {
+  if (/^[A-Za-z0-9_-]{1,80}$/.test(linkedRecording)) {
+    openLibraryItem(linkedRecording).catch(() => toast("Recording could not be opened. Check the connection and Library.", true));
+  } else {
+    toast("Invalid recording link.", true);
+  }
+}

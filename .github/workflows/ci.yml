@@ -1,0 +1,84 @@
+name: Desktop checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements-cpu.txt -r requirements-dev.txt
+      - name: Run isolated regression tests
+        env:
+          HF_HUB_OFFLINE: '1'
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          LISTENFLOW_MODE: local
+          LISTENFLOW_DATA_DIR: ${{ runner.temp }}/listenflow-data
+          LIBRARY_DB: ${{ runner.temp }}/listenflow-data/library.db
+        run: python -m pytest tests -q
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Check browser JavaScript
+        run: |
+          node --check static/app.js
+          node --check scripts/browser-check.cjs
+
+  windows-install:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg --yes --no-progress
+      - name: Install through the Windows setup script
+        shell: pwsh
+        run: |
+          $env:LISTENFLOW_PYTHON = (Get-Command python).Source
+          cmd /c setup.bat cpu --no-pause
+          if ($LASTEXITCODE -ne 0) { throw 'Windows setup failed.' }
+          .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Test dependency installation failed.' }
+          .venv\Scripts\python.exe -m pip check
+      - name: Check workflow and launcher regressions
+        env:
+          HF_HUB_OFFLINE: '1'
+          LISTENFLOW_MODE: local
+          LISTENFLOW_DATA_DIR: ${{ runner.temp }}/listenflow-data
+          LIBRARY_DB: ${{ runner.temp }}/listenflow-data/library.db
+        run: .venv\Scripts\python.exe -m pytest tests -q
+      - name: Run a real local transcription smoke test
+        env:
+          SMOKE_MODEL: tiny
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        run: .venv\Scripts\python.exe test_smoke.py
+      - name: Audit the installed environment
+        shell: pwsh
+        run: |
+          python -m venv "${{ runner.temp }}/listenflow-audit"
+          & "${{ runner.temp }}/listenflow-audit/Scripts/python.exe" -m pip install pip-audit==2.10.1
+          & "${{ runner.temp }}/listenflow-audit/Scripts/python.exe" -m pip_audit --path .venv/Lib/site-packages --strict -f json -o "${{ runner.temp }}/listenflow-audit.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency audit failed.' }
+      - name: Save audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-audit
+          path: ${{ runner.temp }}/listenflow-audit.json
