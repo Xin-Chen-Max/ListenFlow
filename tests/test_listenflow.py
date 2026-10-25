@@ -111,9 +111,64 @@ def test_edits_persist_clear_stale_word_alignment_and_update_exports(client):
 
 def test_patterns_endpoint_explains_text_candidates_only(client):
     id = create(client)
-    patterns = client.get(f"/api/library/{id}/patterns").json()["patterns"]
-    assert len(patterns) == 3
+    data = client.get(f"/api/library/{id}/patterns").json()
+    patterns = data["patterns"]
+    assert {(p["phrase"], p["rule_id"]) for p in patterns} == {
+        ("Did you", "assimilation.yod"), ("get it", "consonant.flap"), ("get it", "linking.c_v"),
+        ("want to", "elision.cluster_td"), ("want to", "reduction.function_word"), ("listen again", "linking.c_v")}
     assert all(p["label"] == "Possible pattern" and p["evidence"] == "text-rule" for p in patterns)
+    assert all(p["status"] in {"candidate", "uncertain"} and p["confidence"] is None for p in patterns)
+    assert all(p["source_audio"] == f"/api/library/{id}/media" for p in patterns)
+    assert data["schema_version"] == "1.0" and data["capabilities"]["acoustically_verified"] == []
+    assert data["transcript_fingerprint"] == client.get(f"/api/library/{id}").json()["transcript_fingerprint"]
+    assert data["coverage"]["token_count"] == 9
+    assert (patterns[0]["start"], patterns[0]["end"], patterns[0]["timing"]) == (0, .5, "words")
+
+
+def test_patterns_are_derived_after_edits_with_legacy_audio_and_missing_ids(client):
+    library.add("legacy", "Old.wav", SEGMENTS)
+    before = client.get("/api/library/legacy/patterns").json()
+    assert all(p["source_audio"] is None for p in before["patterns"])
+    assert client.patch("/api/library/legacy", json={"texts": ["Need it. Turn off. See it. Did you want to?", "zzqxunknown"]}).status_code == 200
+    after = client.get("/api/library/legacy/patterns").json()
+    assert before["transcript_fingerprint"] != after["transcript_fingerprint"]
+    assert {"linking.c_v", "linking.v_v", "assimilation.yod", "reduction.function_word"} <= {p["rule_id"] for p in after["patterns"]}
+    assert all(p["timing"] == "segment" for p in after["patterns"])
+    assert any(d["reason"] == "unknown_word" for d in after["coverage"]["diagnostics"])
+    assert client.get("/api/library/missing/patterns").status_code == 404
+
+
+def test_dictionary_analysis_runs_outside_event_loop(client, monkeypatch):
+    import asyncio
+    import speech_patterns
+    original = speech_patterns.analyze
+    called = []
+
+    def inspect(*args, **kwargs):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        called.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(speech_patterns, "analyze", inspect)
+    id = create(client)
+    assert client.get(f"/api/library/{id}/patterns").status_code == 200
+    assert called == [True]
+
+
+def test_bounded_patterns_api_rejects_stale_transcripts_and_invalid_limits(client):
+    id = create(client)
+    item = client.get(f"/api/library/{id}").json()
+    url = f"/api/library/{id}/patterns"
+    result = client.get(url, params={"view": "summary", "segment_start": 1, "segment_limit": 1,
+                                      "fingerprint": item["transcript_fingerprint"]})
+    assert result.status_code == 200
+    data = result.json()
+    assert data["range"] == {"segment_start": 1, "segment_end": 2, "total_segments": 2}
+    assert all(1 in p["segment_indices"] and "pronunciations" not in p for p in data["patterns"])
+    assert client.get(url, params={"fingerprint": "old"}).status_code == 409
+    for params in ({"segment_limit": 49}, {"segment_start": -1}, {"view": "other"}):
+        assert client.get(url, params=params).status_code == 422
 
 
 def test_subtitle_timestamp_rounding_carries_minutes_and_hours():

@@ -19,7 +19,8 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, Form, HTTPException, Request, Query
+from typing import Literal
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -464,12 +465,17 @@ async def library_list(q: str = "") -> JSONResponse:
 @app.get("/api/library/{item_id}")
 async def library_get(item_id: str) -> JSONResponse:
     import library
+    from pronunciation.context import transcript_fingerprint
 
-    loop = asyncio.get_event_loop()
-    item = await loop.run_in_executor(None, library.get, item_id)
-    if not item:
-        raise HTTPException(404, "Transcript not in the library.")
-    return JSONResponse(_public_item(item))
+    def read():
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(404, "Transcript not in the library.")
+        result = _public_item(item)
+        result["transcript_fingerprint"] = transcript_fingerprint(item["segments"])
+        return JSONResponse(result)
+
+    return await asyncio.to_thread(read)
 
 
 @app.delete("/api/library/{item_id}")
@@ -553,12 +559,23 @@ class _ClipRequest(BaseModel):
 
 
 @app.get("/api/library/{item_id}/patterns")
-async def pattern_list(item_id: str) -> JSONResponse:
-    from speech_patterns import candidates
-    item = library.get(item_id)
-    if not item:
-        raise HTTPException(404, "Recording not found.")
-    return JSONResponse({"patterns": candidates(item["segments"])})
+async def pattern_list(item_id: str, segment_start: int = Query(0, ge=0),
+                       segment_limit: int | None = Query(None, ge=1, le=48),
+                       view: Literal["full", "summary"] = "full", fingerprint: str | None = None) -> JSONResponse:
+    from speech_patterns import analyze
+    from pronunciation.context import transcript_fingerprint
+
+    def derive():
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(404, "Recording not found.")
+        if fingerprint is not None and fingerprint != transcript_fingerprint(item["segments"]):
+            raise HTTPException(409, "The transcript changed. Reopen it from Library.")
+        return JSONResponse(analyze(item["segments"], source_audio=_public_item(item)["media_url"],
+                                    segment_start=segment_start, segment_limit=segment_limit, view=view))
+
+    # Dictionary loading, SQLite reads and rule evaluation must not block live events.
+    return await asyncio.to_thread(derive)
 
 
 @app.post("/api/library/{item_id}/clips")

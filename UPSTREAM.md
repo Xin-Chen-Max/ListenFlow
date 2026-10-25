@@ -16,4 +16,6 @@ Original author: Jesse Jolly (SFX Tech Innovation). The upstream MIT license and
 
 The speech recognition models and underlying transcription engine are existing open-source work. ListenFlow does not claim model training, a new ASR architecture, or measured improvement in recognition accuracy.
 
+The original [CMU US English pronunciation dictionary](pronunciation/data/cmudict/PROVENANCE.md) is bundled at a pinned commit with its own unchanged [license](pronunciation/data/cmudict/LICENSE). ListenFlow supplies the reader, context rules and learner interface; dictionary alternatives are text evidence and do not establish recorded pronunciation. No third-party dictionary wrapper, G2P runtime or forced aligner is included.
+
 This source selection covers the desktop application. The upstream queue/Kubernetes service and the unfinished native mobile companion are outside this version's scope. Optional local Ollama insights and speaker diarization come from the upstream application; they are not required for the listening workflow.

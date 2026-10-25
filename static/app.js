@@ -36,7 +36,8 @@ const aiNote = $("aiNote"), aiBody = $("aiBody");
 const listenControls = $("listenControls"), speedSel = $("playbackSpeed");
 const smartReplayBtn = $("smartReplay"), loopBtn = $("loopToggle"), loopLabel = $("loopLabel");
 const studyPanel = $("studyPanel"), savedClips = $("savedClips");
-const patternPanel = $("patternPanel"), patternList = $("patternList");
+let patternObserver = null;
+const PATTERN_PAGE_SIZE = 24;
 
 // --- state -------------------------------------------------------------------
 const jobs = new Map();   // id -> job
@@ -458,6 +459,7 @@ function setActive(id) {
 
 function renderActive() {
   const job = jobs.get(activeId);
+  if (patternObserver) patternObserver.disconnect();
   // tear down previous player
   if (activeMediaEl) { activeMediaEl.pause(); activeMediaEl.removeAttribute("src"); activeMediaEl.load(); }
   if (activeMediaURL) { URL.revokeObjectURL(activeMediaURL); activeMediaURL = null; }
@@ -487,11 +489,13 @@ function renderActive() {
   transcriptEl.classList.toggle("editing", job.editing);
   job.segments.forEach((s) => { if (s.textEl) s.textEl.contentEditable = job.editing ? "true" : "false"; });
   searchEl.value = job.searchQuery || "";
-  runSearch(job.searchQuery || "");
+  if (job.searchQuery) runSearch(job.searchQuery);
+  else { matches = []; matchIndex = -1; searchCount.textContent = ""; searchPrev.hidden = searchNext.hidden = true; }
 
   renderAi(job);
   renderStudy(job);
   renderFocusLive(job);
+  observePatternSegments(job);
 }
 
 // Update the progress panel + meta for the focused job without rebuilding DOM.
@@ -564,36 +568,73 @@ function skeletonHTML() {
     '<div class="sk-lines"><div class="sk-line"></div><div class="sk-line short"></div></div></div>';
   return '<div class="skeleton" aria-hidden="true">' + row + row + row + "</div>";
 }
-// Fill a segment's text node. When idle it renders one span per word so the
-// current word can be highlighted during playback; while editing or searching it
-// falls back to plain text (search paints its own <mark>s over the top).
+// Keep reading cues outside editable/searchable text and preserve word identity.
+function sentenceSpans(text) {
+  const spans = []; let start = 0;
+  for (const match of text.matchAll(/[.!?]+(?:["')\]]+)?(?:\s+|$)/g)) {
+    const end = match.index + match[0].length;
+    if (text.slice(start, end).trim()) spans.push({ start, end });
+    start = end;
+  }
+  if (text.slice(start).trim()) spans.push({ start, end: text.length });
+  return spans.length ? spans : [{ start: 0, end: text.length }];
+}
 function paintSegText(seg, job) {
   const el = seg.textEl;
   if (!el) return;
-  const searching = !!(job.searchQuery && job.searchQuery.trim());
-  if (job.editing || searching || !(seg.words && seg.words.length)) {
-    el.textContent = seg.text;
-    seg.wordEls = null;
-    return;
-  }
-  el.innerHTML = seg.words
-    .map((w, i) => '<span class="w" data-wi="' + i + '">' + escapeHtml(w.word) + "</span>")
-    .join("");
-  seg.wordEls = Array.prototype.slice.call(el.querySelectorAll(".w"));
-  seg.wordEls.forEach((span, i) => {
-    const w = seg.words[i];
-    if ((job.patterns || []).some((p) => p.timing === "words" && w.start >= p.start && w.end <= p.end)) {
-      span.classList.add("pattern-word"); span.title = "Possible connected-speech pattern; not confirmed in audio";
-    }
+  const plain = job.editing || !!(job.searchQuery || "").trim();
+  el.textContent = seg.text; el.hidden = !plain; seg.readingEl.hidden = plain;
+  if (plain) { seg.wordEls = null; return; }
+  seg.readingEl.replaceChildren();
+  const index = job.segments.indexOf(seg);
+  const tokens = [...seg.text.matchAll(/[\p{L}\p{N}_]+(?:['’\-][\p{L}\p{N}_]+)*/gu)];
+  const normalized = (text) => text.toLowerCase().replaceAll("’", "'");
+  const aligned = tokens.length === (seg.words || []).length && tokens.every((token, i) => {
+    const word = [...seg.words[i].word.matchAll(/[\p{L}\p{N}_]+(?:['’\-][\p{L}\p{N}_]+)*/gu)];
+    return word.length === 1 && normalized(word[0][0]) === normalized(token[0]);
   });
+  seg.sentenceUnits = sentenceSpans(seg.text).map((span) => {
+    const unit = { ...span, analysisStart: [...seg.text.slice(0, span.start)].length,
+      analysisEnd: [...seg.text.slice(0, span.end)].length }, row = document.createElement("div"), text = document.createElement("span");
+    row.className = "sentence-unit"; text.className = "sentence-text";
+    let cursor = span.start;
+    if (aligned) tokens.forEach((token, wi) => {
+      if (token.index < span.start || token.index >= span.end) return;
+      text.append(document.createTextNode(seg.text.slice(cursor, token.index)));
+      const word = document.createElement("span"); word.className = "w"; word.dataset.wi = wi; word.textContent = token[0];
+      text.appendChild(word); cursor = token.index + token[0].length;
+    });
+    text.append(document.createTextNode(seg.text.slice(cursor, span.end)));
+    text.addEventListener("click", (event) => {
+      event.stopPropagation(); const word = event.target.closest(".w");
+      seekTo(word ? seg.words[Number(word.dataset.wi)].start : seg.start);
+    });
+    unit.cuesEl = document.createElement("div"); unit.cuesEl.className = "sentence-patterns";
+    unit.detailsEl = document.createElement("details"); unit.detailsEl.className = "sentence-details";
+    unit.detailsEl.id = "sentence-details-" + index + "-" + span.start;
+    const summary = document.createElement("summary"); summary.textContent = "Details";
+    unit.detailsContent = document.createElement("div"); unit.detailsContent.className = "pattern-detail-list";
+    unit.detailsEl.append(summary, unit.detailsContent);
+    unit.detailsEl.addEventListener("toggle", () => {
+      if (unit.detailsEl.open) renderSentenceDetails(job, seg, index, unit);
+      else { unit.selectedPattern = null; unit.cuesEl.querySelectorAll("button").forEach((b) => b.setAttribute("aria-expanded", "false")); }
+    });
+    unit.detailsEl.addEventListener("click", (event) => event.stopPropagation());
+    unit.cuesEl.addEventListener("click", (event) => event.stopPropagation());
+    row.append(text, unit.cuesEl, unit.detailsEl); seg.readingEl.appendChild(row);
+    return unit;
+  });
+  seg.wordEls = aligned ? [...seg.readingEl.querySelectorAll(".w")] : null;
+  renderInlineCues(job, seg, index);
 }
 function makeSegEl(job, seg) {
   const row = document.createElement("div");
   row.className = "seg";
   const t = document.createElement("span");
   t.className = "t"; t.textContent = mmss(seg.start); t.title = "Jump to " + mmss(seg.start);
-  const text = document.createElement("span");
-  text.className = "seg-text";
+  const body = document.createElement("div"); body.className = "seg-body";
+  const text = document.createElement("div"), reading = document.createElement("div");
+  text.className = "seg-text"; reading.className = "seg-reading";
   text.contentEditable = job.editing ? "true" : "false";
   row.appendChild(t);
   if (seg.speaker != null) {
@@ -602,7 +643,7 @@ function makeSegEl(job, seg) {
     chip.textContent = "Speaker " + (seg.speaker + 1);
     row.appendChild(chip);
   }
-  row.appendChild(text);
+  body.append(text, reading); row.appendChild(body);
   const actions = document.createElement("span"); actions.className = "seg-actions";
   for (const [label, action] of [
     ["Save clip", () => saveClip(job, job.segments.indexOf(seg))],
@@ -612,7 +653,7 @@ function makeSegEl(job, seg) {
     button.addEventListener("click", (e) => { e.stopPropagation(); action(); }); actions.appendChild(button);
   }
   row.appendChild(actions);
-  seg.el = row; seg.textEl = text;
+  seg.el = row; seg.textEl = text; seg.readingEl = reading;
   paintSegText(seg, job);
   t.addEventListener("click", (e) => { e.stopPropagation(); seekTo(seg.start); });
   row.addEventListener("click", () => { if (!job.editing) seekTo(seg.start); });
@@ -790,21 +831,188 @@ loopBtn.addEventListener("click", () => {
   } else { job.playRange = null; updateLoopLabel(job); }
 });
 
-async function loadStudy(job) {
+function studySnapshot(segments) {
+  return JSON.stringify(segments.map((s) => ({ text: s.text, start: s.start, end: s.end, speaker: s.speaker ?? null,
+    words: (s.words || []).map((w) => ({ word: w.word, start: w.start, end: w.end, speaker: w.speaker ?? null })) })));
+}
+function resetPatternState(job) {
+  job.patternRevision = (job.patternRevision || 0) + 1;
+  for (const page of [...(job.patternPages?.values() || []), ...(job.patternDetails?.values() || [])]) page.controller?.abort();
+  job.patternPages = new Map(); job.patternDetails = new Map(); job.patternSummary = new Map();
+  job.patternCoverage = new Map(); job.patternWordTokens = new Set();
+}
+async function loadStudy(job, force = false) {
   if (!job.storageId || job.status !== "done") return;
-  try {
-    const [itemRes, patternRes] = await Promise.all([
-      fetch("/api/library/" + encodeURIComponent(job.storageId)),
-      fetch("/api/library/" + encodeURIComponent(job.storageId) + "/patterns"),
-    ]);
-    if (!itemRes.ok || !patternRes.ok) throw new Error("Practice data is unavailable.");
-    const item = await itemRes.json(), data = await patternRes.json();
-    job.clips = item.clips || []; job.patterns = data.patterns || []; job.studyLoaded = true;
-    if (job.id === activeId) {
-      job.segments.forEach((seg) => { if (!job.editing && !job.searchQuery) paintSegText(seg, job); });
-      renderStudy(job);
+  if (job.studyPromise && !force) return job.studyPromise;
+  if (force || !job.patternPages) resetPatternState(job);
+  const request = (job.studyRequest || 0) + 1, snapshot = studySnapshot(job.segments);
+  job.studyRequest = request; job.studyLoading = true; job.studyLoaded = false; job.studyError = null;
+  job.studyPromise = (async () => {
+    try {
+      const res = await fetch("/api/library/" + encodeURIComponent(job.storageId));
+      if (!res.ok) throw new Error("Practice data could not be loaded. Please retry.");
+      const item = await res.json();
+      if (request !== job.studyRequest || snapshot !== studySnapshot(job.segments)) return;
+      if (studySnapshot(item.segments || []) !== snapshot) throw new Error("The saved transcript changed. Reopen it from Library.");
+      job.clips = item.clips || []; job.transcriptFingerprint = item.transcript_fingerprint;
+      job.studyLoaded = true;
+    } catch (error) {
+      if (request === job.studyRequest) job.studyError = error.message;
+    } finally {
+      if (request === job.studyRequest) {
+        job.studyLoading = false; job.studyPromise = null;
+        if (job.id === activeId) {
+          renderStudy(job);
+          if (job.studyError) job.segments.forEach((seg, i) => { if (seg.readingEl) renderInlineCues(job, seg, i); });
+          observePatternSegments(job);
+        }
+      }
     }
-  } catch (e) { if (job.id === activeId) toast(e.message, true); }
+  })();
+  return job.studyPromise;
+}
+function patternUrl(job, start, limit, view) {
+  const query = new URLSearchParams({ segment_start: start, segment_limit: limit, view, fingerprint: job.transcriptFingerprint });
+  return "/api/library/" + encodeURIComponent(job.storageId) + "/patterns?" + query;
+}
+async function readPatternResponse(job, response, fingerprint) {
+  if (!response.ok) throw new Error(response.status === 409 ? "The transcript changed. Reopen it from Library." : "Speech opportunities could not be loaded. Please retry.");
+  const data = await response.json();
+  if (!data.range || !["summary", "full"].includes(data.view)) throw new Error("Restart ListenFlow to load the updated speech analysis, then refresh this page.");
+  if (!data.transcript_fingerprint || data.transcript_fingerprint !== fingerprint) throw new Error("Analysis and transcript versions differ. Please retry.");
+  return data;
+}
+function preserveReadingPosition(job, update) {
+  const bounds = transcriptEl.getBoundingClientRect();
+  const anchor = job.segments.find((s) => s.el && s.el.getBoundingClientRect().bottom > bounds.top);
+  const top = anchor?.el.getBoundingClientRect().top;
+  update();
+  if (anchor && top != null) transcriptEl.scrollTop += anchor.el.getBoundingClientRect().top - top;
+}
+function updatePatternRows(job, start, end) {
+  if (job.id !== activeId || job.editing || (job.searchQuery || "").trim()) return;
+  preserveReadingPosition(job, () => {
+    for (let i = start; i < end; i++) if (job.segments[i]?.readingEl) renderInlineCues(job, job.segments[i], i);
+  });
+}
+function ensurePatternPage(job, index, force = false) {
+  if (!job.studyLoaded || !job.transcriptFingerprint) return Promise.resolve();
+  if (!job.patternPages) resetPatternState(job);
+  const start = Math.floor(index / PATTERN_PAGE_SIZE) * PATTERN_PAGE_SIZE, end = Math.min(start + PATTERN_PAGE_SIZE, job.segments.length);
+  const existing = job.patternPages.get(start);
+  if (existing && !force) return existing.promise || Promise.resolve(existing.data);
+  existing?.controller?.abort();
+  const revision = job.patternRevision, fingerprint = job.transcriptFingerprint;
+  const page = { state: "loading", controller: new AbortController() }; job.patternPages.set(start, page);
+  page.promise = (async () => {
+    try {
+      const data = await readPatternResponse(job, await fetch(patternUrl(job, start, PATTERN_PAGE_SIZE, "summary"), { signal: page.controller.signal }), fingerprint);
+      if (revision !== job.patternRevision || fingerprint !== job.transcriptFingerprint || job.patternPages.get(start) !== page) return;
+      page.data = data; page.state = "done";
+      for (let i = start; i < end; i++) {
+        job.patternSummary.set(i, data.patterns.filter((p) => p.segment_indices.includes(i)));
+        job.patternCoverage.set(i, data.coverage.diagnostics.filter((d) => d.segment_index === i));
+      }
+      data.patterns.filter((p) => p.timing === "words").forEach((p) => p.tokens.forEach((t) => job.patternWordTokens.add(t.id)));
+      return data;
+    } catch (error) { if (error.name !== "AbortError" && revision === job.patternRevision) { page.state = "error"; page.error = error.message; } }
+    finally { if (revision === job.patternRevision && job.patternPages.get(start) === page) updatePatternRows(job, start, end); }
+  })();
+  return page.promise;
+}
+function observePatternSegments(job) {
+  if (patternObserver) patternObserver.disconnect();
+  if (job.id !== activeId || job.status !== "done" || !job.studyLoaded || job.editing || (job.searchQuery || "").trim()) return;
+  patternObserver = new IntersectionObserver((entries) => {
+    entries.filter((entry) => entry.isIntersecting).forEach((entry) => {
+      if (job.id === activeId && !job.editing) ensurePatternPage(job, Number(entry.target.dataset.segmentIndex));
+    });
+  }, { root: transcriptEl, rootMargin: "200px 0px" });
+  job.segments.forEach((seg, index) => {
+    seg.el.dataset.segmentIndex = index; patternObserver.observe(seg.el);
+  });
+}
+function sentencePatterns(patterns, index, unit) {
+  return patterns.filter((p) => p.tokens.some((t) => t.segment_index === index && t.char_start >= unit.analysisStart && t.char_start < unit.analysisEnd));
+}
+function renderInlineCues(job, seg, index) {
+  (seg.wordEls || []).forEach((word, wi) => word.classList.toggle("pattern-word", !!job.patternWordTokens?.has("s" + index + ":t" + wi)));
+  const page = job.patternPages?.get(Math.floor(index / PATTERN_PAGE_SIZE) * PATTERN_PAGE_SIZE);
+  (seg.sentenceUnits || []).forEach((unit) => {
+    unit.cuesEl.hidden = job.status !== "done"; unit.detailsEl.hidden = job.status !== "done";
+    unit.cuesEl.replaceChildren();
+    if (job.status !== "done") return;
+    const patterns = sentencePatterns(job.patternSummary?.get(index) || [], index, unit);
+    const label = document.createElement("span"); label.className = "pattern-caption"; label.textContent = "Possible pattern";
+    unit.cuesEl.appendChild(label);
+    patterns.forEach((pattern) => {
+      const button = document.createElement("button"); button.className = "pattern-cue";
+      button.dataset.ruleId = pattern.rule_id; button.title = pattern.notation.note;
+      button.setAttribute("aria-expanded", String(unit.detailsEl.open && unit.selectedPattern === pattern.id));
+      button.setAttribute("aria-controls", unit.detailsEl.id);
+      const name = document.createElement("span"); name.className = "cue-name";
+      name.textContent = pattern.notation.label + (pattern.status === "uncertain" ? "? " : " "); button.appendChild(name);
+      pattern.notation.parts.forEach((part, i) => {
+        if (i && pattern.rule_id === "reduction.function_word") button.append(" · ");
+        const mark = document.createElement(part.kind === "omission" ? "s" : "span"); mark.textContent = part.text; button.appendChild(mark);
+      });
+      button.addEventListener("click", () => {
+        unit.cuesEl.querySelectorAll("button").forEach((b) => b.setAttribute("aria-expanded", "false"));
+        button.setAttribute("aria-expanded", "true");
+        unit.selectedPattern = pattern.id;
+        if (unit.detailsEl.open) renderSentenceDetails(job, seg, index, unit);
+        else unit.detailsEl.open = true;
+      });
+      unit.cuesEl.appendChild(button);
+    });
+    if (!patterns.length) {
+      const hint = document.createElement("span"); hint.className = "cue-state";
+      hint.textContent = job.studyError || page?.error || (page?.state === "done" ? "No supported cue · Details" : "Loading cues…");
+      unit.cuesEl.appendChild(hint);
+    }
+  });
+}
+function ensurePatternDetails(job, index, force = false) {
+  if (!job.patternDetails) resetPatternState(job);
+  const existing = job.patternDetails.get(index);
+  if (existing && !force) return existing.promise;
+  existing?.controller.abort();
+  const revision = job.patternRevision, fingerprint = job.transcriptFingerprint;
+  const page = { state: "loading", controller: new AbortController() }; job.patternDetails.set(index, page);
+  page.promise = (async () => {
+    try {
+      const data = await readPatternResponse(job, await fetch(patternUrl(job, index, 1, "full"), { signal: page.controller.signal }), fingerprint);
+      if (revision !== job.patternRevision || fingerprint !== job.transcriptFingerprint || job.patternDetails.get(index) !== page) return;
+      page.data = data; page.state = "done";
+    } catch (error) { if (error.name !== "AbortError" && revision === job.patternRevision) { page.state = "error"; page.error = error.message; } }
+  })();
+  return page.promise;
+}
+async function renderSentenceDetails(job, seg, index, unit, force = false) {
+  const content = unit.detailsContent;
+  content.textContent = "Loading explanation…";
+  if (!job.studyLoaded) await loadStudy(job, !!job.studyError);
+  if (!job.studyLoaded) { content.textContent = job.studyError || "Save your edits before opening details."; return; }
+  const revision = job.patternRevision;
+  await ensurePatternDetails(job, index, force);
+  if (revision !== job.patternRevision || job.id !== activeId || !unit.detailsEl.open || !content.isConnected) return;
+  const page = job.patternDetails.get(index);
+  content.replaceChildren();
+  const note = (text, cls = "study-note") => { const p = document.createElement("p"); p.className = cls; p.textContent = text; content.appendChild(p); };
+  if (page.state === "error") {
+    note(page.error, "study-note pattern-error");
+    content.appendChild(practiceButton("Retry analysis", () => renderSentenceDetails(job, seg, index, unit, true))); return;
+  }
+  if (!page.data) return;
+  note("Possible pattern · text-based example. Not confirmed in the recording.");
+  const diagnostics = page.data.coverage.diagnostics;
+  const unknown = diagnostics.filter((d) => ["unknown_word", "unsupported_normalization"].includes(d.reason));
+  if (unknown.length) note("Dictionary coverage is incomplete: " + unknown.map((d) => d.text).join(", ") + ". These tokens were not guessed.");
+  if (diagnostics.some((d) => d.reason === "word_timing_unavailable_or_stale")) note("Word timing is unavailable or stale. Replay uses the whole segment.");
+  let patterns = sentencePatterns(page.data.patterns, index, unit);
+  if (unit.selectedPattern) patterns = patterns.filter((p) => p.id === unit.selectedPattern);
+  if (!patterns.length) note("No supported opportunity was found by these six rule families. Connected speech may still be present; this is not an audio verification result.");
+  patterns.forEach((pattern) => content.appendChild(patternCard(job, pattern, page.data)));
 }
 async function saveClip(job, index) {
   if (job.dirty || job.editing) { toast("Save your transcript edits before practicing this phrase."); return; }
@@ -836,13 +1044,16 @@ async function showPatterns(job, index) {
   if (job.dirty || job.editing) { toast("Save your transcript edits before exploring patterns."); return; }
   if (job.status !== "done") { toast("Finish transcription before exploring patterns."); return; }
   if (!job.studyLoaded) await loadStudy(job);
-  job.patternSegment = index;
-  renderStudy(job); patternPanel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const seg = job.segments[index], unit = seg.sentenceUnits?.[0];
+  if (!unit) return;
+  unit.selectedPattern = null;
+  if (unit.detailsEl.open) renderSentenceDetails(job, seg, index, unit);
+  else unit.detailsEl.open = true;
 }
 function renderStudy(job) {
   studyPanel.hidden = !job || job.status !== "done";
   if (studyPanel.hidden) return;
-  savedClips.innerHTML = "";
+  savedClips.replaceChildren();
   if (!(job.clips || []).length) {
     const hint = document.createElement("p"); hint.className = "study-note";
     hint.textContent = "Choose Save clip beside a transcript phrase to practice it later."; savedClips.appendChild(hint);
@@ -853,24 +1064,41 @@ function renderStudy(job) {
     row.append(text, practiceButton("Replay clip", () => replayRange(job, clip.start, clip.end)),
       practiceButton("Remove clip", () => removeClip(job, clip))); savedClips.appendChild(row);
   });
-  patternPanel.hidden = job.patternSegment == null;
-  patternList.innerHTML = "";
-  const patterns = (job.patterns || []).filter((p) => p.segment_index === job.patternSegment);
-  if (!patterns.length) {
-    const hint = document.createElement("p"); hint.className = "study-note";
-    hint.textContent = "No supported text-rule candidate in this phrase. You can still replay it and listen for connections.";
-    patternList.appendChild(hint);
-  }
-  patterns.forEach((pattern) => {
+}
+function patternCard(job, pattern, analysis) {
     const card = document.createElement("div"); card.className = "pattern-card";
-    const label = document.createElement("strong"); label.textContent = pattern.label + " · " + pattern.category;
+    card.dataset.ruleId = pattern.rule_id; card.dataset.status = pattern.status;
+    const category = analysis?.capabilities?.taxonomy?.[pattern.category] || pattern.category;
+    const label = document.createElement("strong");
+    label.textContent = "Possible pattern — " + (pattern.status === "uncertain" ? "Conditional opportunity — context uncertain" : "text-based opportunity") + " · " + category;
     const phrase = document.createElement("p"); phrase.className = "pattern-phrase"; phrase.textContent = pattern.phrase;
     const explanation = document.createElement("p"); explanation.textContent = pattern.explanation;
+    if (pattern.rule_id === "reduction.function_word") {
+      const targets = pattern.tokens.filter((t) => pattern.target_token_ids.includes(t.id)).map((t) => t.text);
+      explanation.textContent = "Weak-form word: " + targets.join(", ") + ". " + pattern.explanation;
+    }
     const accent = document.createElement("p"); accent.className = "study-note"; accent.textContent = pattern.accent_note;
-    card.append(label, phrase, explanation, accent,
-      practiceButton(pattern.timing === "words" ? "Replay phrase" : "Replay segment", () => replayRange(job, pattern.start, pattern.end)));
-    patternList.appendChild(card);
-  });
+    card.append(label, phrase, explanation, accent);
+    (pattern.assumptions || []).forEach((text) => { const p = document.createElement("p"); p.className = "study-note"; p.textContent = text; card.appendChild(p); });
+    const replay = practiceButton(pattern.timing === "words" ? "Replay phrase" : "Replay segment", () => replayRange(job, pattern.start, pattern.end));
+    replay.disabled = !pattern.source_audio || !job.mediaUrl;
+    if (replay.disabled) { replay.title = "The source recording is unavailable."; replay.textContent = "Audio unavailable"; }
+    card.appendChild(replay);
+    const details = document.createElement("details"), summary = document.createElement("summary");
+    summary.textContent = "Dictionary pronunciation and evidence"; details.appendChild(summary);
+    const evidence = document.createElement("p"); evidence.className = "study-note";
+    evidence.textContent = "Rule " + pattern.rule_id + " v" + pattern.rule_version + ". " + pattern.confidence_reason + " Timing: " + pattern.timing_provenance + ".";
+    details.appendChild(evidence);
+    (pattern.pronunciations || []).forEach((token) => {
+      const p = document.createElement("p"); p.className = "pattern-phones";
+      const ref = pattern.tokens.find((t) => t.id === token.token_id);
+      p.textContent = (ref?.text || token.token_id) + ": " + token.alternatives.map((v) => v.phones.join(" ") + " /" + v.broad_ipa + "/" + (token.supporting_variant_ids.includes(v.variant_id) ? " (supports rule)" : "")).join("; ");
+      details.appendChild(p);
+    });
+    const source = document.createElement("p"); source.className = "study-note";
+    source.textContent = "Dictionary phones and lexical stress, not measured audio. Evidence: " + (pattern.evidence_sources || []).map((e) => e.type + (e.version ? " " + e.version : "")).join("; ");
+    details.appendChild(source); card.appendChild(details);
+  return card;
 }
 
 // --- search (focused job) ----------------------------------------------------
@@ -883,9 +1111,10 @@ function clearHighlights(job) {
 function runSearch(q) {
   const job = jobs.get(activeId); if (!job) return;
   job.searchQuery = q || "";
+  if (patternObserver) patternObserver.disconnect();
   clearHighlights(job);
   q = (q || "").trim();
-  if (!q) { searchCount.textContent = ""; searchPrev.hidden = searchNext.hidden = true; return; }
+  if (!q) { searchCount.textContent = ""; searchPrev.hidden = searchNext.hidden = true; observePatternSegments(job); return; }
   const ql = q.toLowerCase();
   job.segments.forEach((s) => {
     if (!s.textEl) return;
@@ -939,7 +1168,7 @@ editToggle.addEventListener("click", async () => {
       if (!res.ok) throw new Error(data.detail || "Could not save edits.");
       data.segments.forEach((s, i) => { job.segments[i].text = s.text; job.segments[i].words = s.words || []; });
       job.dirty = false;
-      loadStudy(job);
+      loadStudy(job, true);
       toast("Edits saved.");
     } catch (e) { toast(e.message || "Could not save edits. Your changes are still open.", true); return; }
     finally { editToggle.disabled = false; }
@@ -948,6 +1177,7 @@ editToggle.addEventListener("click", async () => {
   editToggle.setAttribute("aria-pressed", job.editing ? "true" : "false");
   editToggle.textContent = job.editing ? "Save edits" : "Edit";
   transcriptEl.classList.toggle("editing", job.editing);
+  if (job.editing && patternObserver) patternObserver.disconnect();
   if (job.editing && searchEl.value) { searchEl.value = ""; runSearch(""); }
   job.segments.forEach((s) => {
     if (s.textEl) { s.textEl.contentEditable = job.editing ? "true" : "false"; paintSegText(s, job); }
@@ -1253,6 +1483,7 @@ async function openLibraryItem(id) {
     duration: d.duration || 0, detectedLang: d.language || "", device: "",
     progress: 1, startedAt: 0, finishedInMs: 0, es: null, errorMsg: d.error || "",
     editing: false, searchQuery: "", tabEl: null, railEl: null, fromLibrary: true,
+    clips: d.clips || [], transcriptFingerprint: d.transcript_fingerprint, studyLoaded: d.status === "done" && !!d.transcript_fingerprint,
   };
   jobs.set(jid, job);
   addTabAndRail(job);
@@ -1262,7 +1493,7 @@ async function openLibraryItem(id) {
   setActive(jid);
   updateRailCount();
   if (job.status === "queued" || job.status === "running") streamJob(job);
-  else loadStudy(job);
+  else if (!job.studyLoaded) loadStudy(job);
 }
 async function deleteLibraryItem(id) {
   const active = jobs.get(activeId);

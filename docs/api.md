@@ -14,7 +14,7 @@ States: queued → running → done/error. On startup, previously queued/running
 ## Library and editing
 
 - GET /api/library?q=: existing searchable entries plus status and error fields.
-- GET /api/library/{id}: existing transcript metadata and segments, plus status, error, diarize, clips, and nullable media_url. Internal media paths are not returned.
+- GET /api/library/{id}: existing transcript metadata and segments, plus status, error, diarize, clips, nullable media_url and transcript_fingerprint. Internal media paths are not returned.
 - GET /api/library/{id}/media: local retained source, supporting range requests. Legacy/missing audio returns 404.
 - PATCH /api/library/{id}: JSON `{ "texts": ["First corrected segment", "Second segment"] }`. Requires a completed recording and unchanged segment count. Saves text, keeps segment boundaries, clears word timings only on edited segments, updates saved clip labels, and refreshes exports.
 - DELETE /api/library/{id}: removes the source folder, export folder, database entry, and clips. Active jobs return 409. Files still in use after a bounded Windows retry return an actionable 409. Missing IDs return 404.
@@ -25,7 +25,45 @@ Uploads use generated storage names. Media and deletion paths must resolve insid
 
 - POST /api/library/{id}/clips: JSON `{ "segment_index": 0 }`. Saves that timestamped segment; repeated saves of the same segment return the same clip. Requires a completed recording.
 - DELETE /api/library/{id}/clips/{clip_id}: removes only the clip belonging to that recording, preserving the recording itself.
-- GET /api/library/{id}/patterns: returns patterns containing segment_index, phrase, category, label, evidence, explanation, accent_note, start, end, and timing. Label is always Possible pattern; evidence is text-rule. Timing is words when the matched words align, otherwise segment.
+- GET /api/library/{id}/patterns: returns a versioned derived analysis envelope with the existing patterns array. Label remains Possible pattern; evidence remains text-rule. Timing is words when the saved words reliably match, otherwise segment. Dictionary loading, SQLite reads, analysis and response encoding run off the event loop.
+
+Envelope fields: schema_version (1.0), engine_version, dictionary_version, transcript_fingerprint, coverage (token_count, dictionary_token_count and diagnostics), capabilities, settings (max_boundary_gap_seconds, default 0.25), patterns. No new database state or analysis cache is written.
+
+Optional query parameters preserve the default full response:
+
+| Parameter | Behavior |
+|---|---|
+| segment_start | Nonnegative first segment, default 0 |
+| segment_limit | 1–48 segments; omitted retains the full remaining transcript |
+| view | full (default) or summary |
+| fingerprint | Expected saved transcript fingerprint; mismatch returns 409 before analysis |
+
+Both views include range (segment_start, segment_end exclusive, total_segments) and view metadata. Ranged analysis includes two neighboring segments on either side for context, then filters to opportunities touching the requested segments. IDs, global token/character references and replay intervals agree with full analysis. Coverage counts and diagnostics describe the requested range only. Invalid limits/start/view return 422.
+
+summary retains identity, rule/category/status, label/evidence, phrase/tokens/segment references, replay intervals/timing, null confidence and notation. It omits detailed pronunciation alternatives, explanations, assumptions and evidence lists. full retains those fields. Notation contains a short label, typed text/link/omission parts, illustrative=true and an explicit example-only note. It does not select a variant as recorded or claim a sound was omitted. Omission marks apply to the eligible phone, not the original transcript spelling.
+
+The browser requests 24-segment summaries near the viewport and one-segment full details on click. It caches them per recording/fingerprint, aborts superseded requests after edits and never requests the unbounded endpoint. Applying summaries updates cues and underline classes without replacing word nodes. No server-side analysis cache, database migration or dependency was added.
+
+Each pattern retains segment_index, phrase, category, label, evidence, explanation, accent_note, start, end and timing. Additive fields:
+
+| Field | Meaning |
+|---|---|
+| id, rule_id, rule_version | Stable analysis result and versioned rule identity |
+| status | candidate or uncertain in this text-only stage |
+| tokens, target_token_ids | Original token identity, offsets, spelling/normalization and affected targets |
+| segment_indices | All affected segments; cross-segment cards appear beside either segment |
+| timing_provenance | Existing ASR word timestamps or saved segment timestamps; no phone alignment implied |
+| source_audio | Existing authenticated relative media URL, or null for missing/legacy audio |
+| transcript_fingerprint | SHA-256 of saved text, times, words and speakers |
+| pronunciations | All dictionary variants, ARPABET, broad IPA and supporting variant IDs |
+| evidence_sources, assumptions | Saved-text/dictionary/rule provenance and contextual limitations |
+| confidence, confidence_reason | null and the explicit uncalibrated reason |
+
+Categories use stable IDs linking, reduction, elision, assimilation, consonant_phenomena, prosody; the capability taxonomy supplies display names. Six implemented text rules are listed in [speech opportunities](speech-opportunities.md). Function-word targets mark weak alternatives separately from strong ones. Equivalent rule/span matches are grouped; different overlapping rules remain distinct.
+
+The browser compares item and analysis fingerprints and rejects differing versions. Request generations also discard responses superseded by edits. Missing/stale timing uses segment replay; cross-segment candidates require valid continuous word timing. Coverage diagnoses unknown words, unsupported normalization, stale/missing words and invalid segment times. A successful empty result makes no claim about the presence or absence of connected speech. Failed requests show a retryable error.
+
+observed and not_observed are reserved for a separately validated acoustic stage. They are never emitted by this increment. A forced alignment, dictionary match, or lexical stress mark is not pronunciation verification. Confidence is not inferred from dictionary order, alignment or a rule match.
 
 Sentence/phrase replay and speed are browser playback controls. Saved clips use transcript segment intervals. Browser playback settings do not change the media file or its timestamps.
 

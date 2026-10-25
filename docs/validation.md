@@ -1,5 +1,20 @@
 # Validation
 
+## Inline cues and bounded loading (2026-10-24)
+
+Local backend/smoke/publication checks passed 158 tests and 16 subtests in 21.09 s, with one existing TestClient deprecation warning. The curated export separately passed 147 tests in 11.36 s, using documented FFmpeg settings. Full Chrome acceptance passed actual desktop transcription/playback/edit/export/restart/deletion/retry plus inline cues, phone strikethrough, sentence/Unicode placement, lazy evidence/error/retry/cache, stale-response protection, selection/node preservation and mobile layout. No browser error or external request was recorded.
+
+A 1,200-segment synthetic Library fixture measured 1,038 ms to first cues, 408 ms to first details, 133 ms for cached details with no new request. Initial summary/detail bodies were 272,835 / 37,663 bytes; no full-transcript analysis was requested. This is one warm-server run including browser-test overhead. See [speech opportunities](speech-opportunities.md) for exact CPU/payload measurements and limitations. No runtime dependency changed. New remote CI, clean Windows and container checks are unrun; no acoustic verification is implemented.
+
+
+## Dictionary-backed speech opportunities (2026-10-24)
+
+The full local backend/smoke/publication suite passed 143 tests and 16 subtests in 21.00 s. From the curated source directory, 132 tests passed in 11.37 s with the documented FFmpeg settings. Both runs reported one existing Starlette TestClient/httpx deprecation warning. JavaScript syntax and full Chrome acceptance passed, including actual local transcription, playback/edit/export/restart/deletion/retry and the new candidate/evidence/coverage/error/stale-response/cross-segment/missing-audio behavior.
+
+Six text-rule families have positive and negative tests. Dictionary/license hashes, alternative pronunciations, stress assumptions, original token offsets, conservative timing boundaries and the prohibition on acoustic claims are checked. Extra text/timing fixtures test UI behavior; their timestamps are not accuracy evidence. See [speech opportunities](speech-opportunities.md) for exact CPU long-transcript measurements and the large-response limitation.
+
+No runtime dependency version changed. New remote CI, clean Windows installation and container builds are unrun for this increment. No acoustic verifier, G2P model or aligner adapter is implemented. Older installation/GPU results below describe their recorded release environment.
+
 The desktop workflow was exercised on Windows with an NVIDIA RTX 5090. These results establish the tested workflows and fixtures; they do not establish general accent accuracy or learning outcomes.
 
 ## Regression checks

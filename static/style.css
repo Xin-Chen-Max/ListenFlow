@@ -68,6 +68,25 @@
 .pattern-card strong{font-size:13px;color:var(--accent)}
 .pattern-card p{margin:8px 0}
 .pattern-phrase{font-family:var(--serif);font-size:21px}
+.pattern-card details{margin-top:12px;overflow-wrap:anywhere}
+.pattern-card summary{cursor:pointer;color:var(--accent);font-size:13px}
+.pattern-phones{font-size:13px;overflow-wrap:anywhere}
+.pattern-error{color:var(--error,#e47a7a)}
+.seg-body{flex:1 1 200px;min-width:0}
+.sentence-unit{margin-bottom:8px}
+.sentence-unit:last-child{margin-bottom:0}
+.sentence-text{white-space:pre-wrap}
+.sentence-patterns{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 8px;min-height:25px;margin-top:3px;cursor:default}
+.pattern-caption,.cue-state{font-size:11px;color:var(--muted)}
+.pattern-cue{border:0;border-radius:5px;padding:2px 5px;background:var(--accent-weak);color:var(--accent);font:13px/1.5 system-ui;cursor:pointer;text-align:left;overflow-wrap:anywhere}
+.pattern-cue:hover,.pattern-cue:focus-visible{box-shadow:0 0 0 1px var(--accent);outline:none}
+.pattern-cue .cue-name{font-size:10px;opacity:.8}
+.pattern-cue s{text-decoration-thickness:2px}
+.sentence-details{font-size:13px;cursor:default}
+.sentence-details>summary{color:var(--muted);font-size:11px;cursor:pointer;width:fit-content}
+.sentence-details[open]{padding:8px;border:1px solid var(--border);border-radius:7px;margin-top:4px}
+.sentence-details .pattern-card{padding:10px}
+.inline-pattern-note{font-size:12px;color:var(--muted);margin:0 0 8px}
 .pattern-word{border-bottom:2px dotted var(--accent)}
 .seg-actions{display:flex;flex-wrap:wrap;gap:4px;margin-left:auto;align-self:center}
 .seg-actions .mini{width:auto;height:auto;min-height:28px;padding:4px 7px;white-space:nowrap;font-size:12px}

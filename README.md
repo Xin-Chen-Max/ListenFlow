@@ -13,6 +13,7 @@ A local English listening workspace. Transcribe a recording on your computer, fo
 - Offers playback speed, sentence loops, and **I missed that** to replay the current or preceding sentence.
 - Saves difficult clips for another listening session.
 - Preserves transcript corrections in TXT and SRT exports.
+- Shows brief dictionary-based speech cues below each sentence: linking IPA, weak forms and possible omitted sounds. Select a cue for explanations and replay.
 - Retains audio after a failed job so transcription can be retried without another upload.
 
 Recordings stay on the computer until explicitly deleted. Whisper models download on first use; transcription runs locally afterward.
@@ -51,10 +52,12 @@ The regression tests use isolated storage. Browser acceptance covers actual tran
 
 This version is a personal desktop application. Android delivery and private phone access have not completed device acceptance. Public hosting and multi-user operation are outside the supported scope.
 
-Connected-speech suggestions are labelled **Possible pattern**. They are inferred from text and have not been confirmed in the audio. Editing a segment clears its old word alignment; playback then uses segment timing.
+Connected-speech suggestions are labelled **Possible pattern**. Six generic rule families use the bundled CMU US English dictionary, including pronunciation alternatives. Conditional opportunities disclose context and stress assumptions. Cues are illustrative, and none has been confirmed in the audio. Long recordings load nearby summaries and cache details on demand. See [speech opportunities](docs/speech-opportunities.md) for supported rules and limits. Editing a segment clears its old word alignment; playback then uses segment timing.
 
 The patched desktop environment passed its current known-vulnerability audit. Keep the application bound to loopback; [security notes](SECURITY.md) describe the audit scope and deployment boundary. Installation, regression tests and CPU transcription passed on a fresh GitHub-hosted Windows runner. See the [validation record](docs/validation.md).
 
 ## License
 
 MIT. The original copyright and license are retained in [LICENSE](LICENSE). The upstream application was created by Jesse Jolly (SFX Tech Innovation).
+
+The bundled CMU dictionary has its own [original license](pronunciation/data/cmudict/LICENSE) and [pinned provenance](pronunciation/data/cmudict/PROVENANCE.md).
